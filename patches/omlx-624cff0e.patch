@@ -1,0 +1,296 @@
+diff --git a/omlx/engine/vlm.py b/omlx/engine/vlm.py
+index abf105c..1e39d0d 100644
+--- a/omlx/engine/vlm.py
++++ b/omlx/engine/vlm.py
+@@ -2081,7 +2081,16 @@ class VLMBatchedEngine(BaseEngine):
+                         ),
+                     )
+                 if model_type == "inkling2":
+-                    return inkling2_vlm.load(self._model_name)
++                    return inkling2_vlm.load(
++                        self._model_name,
++                        lazy=bool(
++                            getattr(
++                                self._model_settings,
++                                "moe_expert_offload_enabled",
++                                False,
++                            )
++                        ),
++                    )
+                 if model_type == "muse_spark":
+                     return muse_spark_model.load(
+                         self._model_name,
+diff --git a/omlx/model_settings.py b/omlx/model_settings.py
+index 08fbd73..0298074 100644
+--- a/omlx/model_settings.py
++++ b/omlx/model_settings.py
+@@ -68,13 +68,20 @@ def validate_moe_expert_offload(settings: dict, model_type: str | None = None) -
+             "VLM MTP, or DFlash; disable speculative decoding first."
+         )
+     # Settings can load before the checkpoint family is known.
+-    if settings.get("mtp_enabled") and model_type is not None:
++    if model_type is not None:
+         family = model_type.replace("-", "_").lower()
+-        if family not in MOE_OFFLOAD_MTP_MODEL_TYPES:
++        if settings.get("mtp_enabled") and family not in MOE_OFFLOAD_MTP_MODEL_TYPES:
+             raise ValueError(
+                 "MoE expert offload cannot be combined with Lightning MTP, "
+                 "VLM MTP, or DFlash; disable speculative decoding first."
+             )
++        helper = settings.get("prefill_helper_node_id")
++        has_helper = bool(helper.strip()) if isinstance(helper, str) else bool(helper)
++        if family == "inkling2" and has_helper:
++            raise ValueError(
++                "MoE expert offload cannot be combined with the Prefill Accelerator "
++                "on Inkling 2; disable one of them first."
++            )
+ 
+ 
+ def ane_prefill_backend(model_type: str | None) -> str | None:
+diff --git a/omlx/patches/inkling2/model.py b/omlx/patches/inkling2/model.py
+index 8496f68..8392333 100644
+--- a/omlx/patches/inkling2/model.py
++++ b/omlx/patches/inkling2/model.py
+@@ -245,27 +245,39 @@ class Inkling2Experts(nn.Module):
+         self._gcap = mx.array(args.mlp_gate_softcap, dtype=mx.float32)
+         self._ucap = mx.array(args.mlp_up_softcap, dtype=mx.float32)
+ 
+-    def __call__(self, x: mx.array, inds: mx.array, weights: mx.array) -> mx.array:
++    def routes(
++        self, x: mx.array, inds: mx.array, sorted_hint: bool | None = None
++    ) -> mx.array:
++        """Compute per-route expert outputs before weighted combination."""
+         xe = mx.expand_dims(x, (-2, -3))
+         do_sort = inds.size >= 64
+         idx = inds
+         inv = None
+         if do_sort:
+             xe, idx, inv = _gather_sort(xe, inds)
+-        y = self.w13(xe, idx, do_sort)
++        qmm_sorted = do_sort if sorted_hint is None else (do_sort and bool(sorted_hint))
++        y = self.w13(xe, idx, qmm_sorted)
+         s13 = self.w13.post_scale(idx)
+         if s13 is not None:
+             y = y * s13[..., None, None].astype(y.dtype)
+         act = _softcapped_swiglu(y[..., 0::2], y[..., 1::2], self._gcap, self._ucap)
+-        z = self.w2(act, idx, do_sort)
++        z = self.w2(act, idx, qmm_sorted)
+         if do_sort:
+             z = _scatter_unsort(z, inv, inds.shape)
+-        z = z.squeeze(-2)
++        return z.squeeze(-2)
++
++    def combine(
++        self, z: mx.array, inds: mx.array, weights: mx.array, x_dtype
++    ) -> mx.array:
++        """Apply w2 post-scale to routing weights, sum in fp32, and cast."""
+         s2 = self.w2.post_scale(inds)
+         if s2 is not None:
+             weights = weights * s2
+         out = mx.sum(z.astype(mx.float32) * weights[..., None], axis=-2)
+-        return out.astype(x.dtype)
++        return out.astype(x_dtype)
++
++    def __call__(self, x: mx.array, inds: mx.array, weights: mx.array) -> mx.array:
++        return self.combine(self.routes(x, inds), inds, weights, x.dtype)
+ 
+ 
+ class Inkling2MoE(nn.Module):
+@@ -285,11 +297,28 @@ class Inkling2MoE(nn.Module):
+             logits, self.router_bias, self.top_k, self.route_scale
+         )
+ 
+-    def __call__(self, x: mx.array) -> mx.array:
++    def route_inputs(self, x: mx.array):
++        """Flatten ``x`` and return ``(flat, inds, weights, shape)``."""
+         shape = x.shape
+         flat = x.reshape(-1, shape[-1])
+         inds, w = self.route(flat)
+-        return self.experts(flat, inds, w).reshape(shape)
++        return flat, inds, w, shape
++
++    def experts_out(
++        self,
++        flat: mx.array,
++        inds: mx.array,
++        weights: mx.array,
++        shape: tuple[int, ...],
++        experts=None,
++    ) -> mx.array:
++        """Run routed experts on flattened inputs and restore ``shape``."""
++        fn = self.experts if experts is None else experts
++        return fn(flat, inds, weights).reshape(shape)
++
++    def __call__(self, x: mx.array) -> mx.array:
++        flat, inds, w, shape = self.route_inputs(x)
++        return self.experts_out(flat, inds, w, shape)
+ 
+ 
+ class AttnResQuery(nn.Module):
+@@ -529,6 +558,21 @@ class Inkling2Layer(nn.Module):
+         layer = weakref.proxy(self)
+         self._pre_compiled = mx.compile(lambda *a: Inkling2Layer._pre(layer, *a))
+         self._post_compiled = mx.compile(lambda *a: Inkling2Layer._post(layer, *a))
++        self._post_attn_compiled = mx.compile(
++            lambda *a: Inkling2Layer._post_attn(layer, *a)
++        )
++        self._post_tail_compiled = mx.compile(
++            lambda *a: Inkling2Layer._post_tail(layer, *a)
++        )
++        self._split_experts = None
++
++    def __setattr__(self, key: str, val: Any):
++        # Keep _split_experts out of nn.Module's child dict even when assigned
++        # an nn.Module such as self.mlp.experts.
++        if key == "_split_experts":
++            object.__setattr__(self, key, val)
++            return
++        super().__setattr__(key, val)
+ 
+     def _pre(self, h, blocks, ks, vs, tau=None):
+         dtype = h.dtype
+@@ -550,7 +594,7 @@ class Inkling2Layer(nn.Module):
+             xv = self.v_input_norm(xv).astype(dtype)
+         return (*self.attn.project(xq, xk, xv, ks, vs, tau), h_n)
+ 
+-    def _post(self, out, gate, h, mlp_blocks, s2, s3):
++    def _post_attn(self, out, gate, h, mlp_blocks, s2):
+         a = self.attn.output(out, gate)
+         a, s2 = _static_conv(a, self.attn_conv, s2, self._conv_scale)
+         if self.is_boundary:
+@@ -558,9 +602,20 @@ class Inkling2Layer(nn.Module):
+         else:
+             residual = h.astype(mx.float32) + a.astype(mx.float32)
+         y = self.mlp_input(mlp_blocks, _unit_rms(residual))[:, :, 0]
+-        m = self.mlp(self.mlp_norm(y).astype(h.dtype))
++        flat, inds, weights, _ = self.mlp.route_inputs(self.mlp_norm(y).astype(h.dtype))
++        return residual, flat, inds, weights, s2
++
++    def _post_tail(self, h, residual, m, s3):
+         m, s3 = _static_conv(m, self.mlp_conv, s3, self._conv_scale)
+-        return (residual + m.astype(mx.float32)).astype(h.dtype), s2, s3
++        return (residual + m.astype(mx.float32)).astype(h.dtype), s3
++
++    def _post(self, out, gate, h, mlp_blocks, s2, s3):
++        residual, flat, inds, weights, s2 = self._post_attn(
++            out, gate, h, mlp_blocks, s2
++        )
++        m = self.mlp.experts_out(flat, inds, weights, h.shape)
++        out_h, s3 = self._post_tail(h, residual, m, s3)
++        return out_h, s2, s3
+ 
+     def __call__(self, h, blocks, cache=None):
+         """``h``: partial block sum [B, L, H] bf16. ``blocks``: list of unit-RMS
+@@ -578,7 +633,6 @@ class Inkling2Layer(nn.Module):
+         tau = self.attn.log_tau(kv, length)
+         compiled = length <= _COMPILED_MAX_TOKENS
+         pre = self._pre_compiled if compiled else self._pre
+-        post = self._post_compiled if compiled else self._post
+         pre_args = (h, blocks, states[0], states[1])
+         if tau is not None:
+             pre_args = (*pre_args, tau)
+@@ -586,7 +640,19 @@ class Inkling2Layer(nn.Module):
+         out = self.attn.attend(q, k, v, rel, sink, kv)
+         if self.is_boundary:
+             blocks.append(h_n)
+-        h, s2, s3 = post(out, gate, h, blocks, states[2], states[3])
++        split = self._split_experts
++        if split is None or split is False:
++            post = self._post_compiled if compiled else self._post
++            h, s2, s3 = post(out, gate, h, blocks, states[2], states[3])
++        else:
++            post_attn = self._post_attn_compiled if compiled else self._post_attn
++            post_tail = self._post_tail_compiled if compiled else self._post_tail
++            residual, flat, inds, weights, s2 = post_attn(
++                out, gate, h, blocks, states[2]
++            )
++            experts_fn = self.mlp.experts if split is True else split
++            m = self.mlp.experts_out(flat, inds, weights, h.shape, experts=experts_fn)
++            h, s3 = post_tail(h, residual, m, states[3])
+         if conv is not None:
+             windows = (ks, vs, s2, s3)
+             if 1 < length <= _COMPILED_MAX_TOKENS:
+diff --git a/omlx/patches/moe_expert_offload.py b/omlx/patches/moe_expert_offload.py
+index 1fe5fa5..cc0b25a 100644
+--- a/omlx/patches/moe_expert_offload.py
++++ b/omlx/patches/moe_expert_offload.py
+@@ -78,6 +78,7 @@ _DTYPES = {
+     "U32": (np.uint32, None),
+     "I32": (np.int32, None),
+     "U8": (np.uint8, None),
++    "F8_E4M3": (np.uint8, None),
+ }
+ 
+ 
+@@ -1079,8 +1080,8 @@ def apply_moe_expert_offload(
+     # GLM DSA blocks have their own adapter (fused gate/up, native weighted
+     # sum); it shares this store format and the same wrap-before-materialize
+     # contract, so the engine sees one count. DeepSeek V4 / glm5_next blocks
+-    # (native block kernels, split projections) follow the same pattern; see
+-    # omlx.patches.deepseek_v4.moe_offload.
++    # (native block kernels, split projections) and Inkling 2 blocks (stacked
++    # NVFP4/MXFP8/affine ExpertProj) follow the same pattern.
+     from .glm_moe_dsa.moe_offload import apply_glm_moe_expert_offload
+ 
+     wrapped = apply_glm_moe_expert_offload(model, model_dir, resident_fraction)
+@@ -1089,6 +1090,9 @@ def apply_moe_expert_offload(
+     wrapped += apply_deepseek_v4_moe_expert_offload(
+         model, model_dir, resident_fraction, mtp_resident=mtp_resident
+     )
++    from .inkling2.moe_offload import apply_inkling2_moe_expert_offload
++
++    wrapped += apply_inkling2_moe_expert_offload(model, model_dir, resident_fraction)
+     total_bytes = resident_bytes = 0
+     staging_sizes = {}
+     staging_requested = (
+@@ -1201,6 +1205,11 @@ def estimate_offload_admission_bytes(
+             if kind == "deepseek_v41":
+                 # V4.1 admission is owned by its own adapter's estimator.
+                 return full_size
++            if kind == "inkling2":
++                from .inkling2.moe_offload import estimate_inkling2_expert_savings
++
++                saved = estimate_inkling2_expert_savings(model_dir, resident_fraction)
++                return max(0, full_size - saved) if saved > 0 else full_size
+             if kind == "qwen3_5_moe":
+                 from .moe_offload_compat import moe_offload_compatibility
+ 
+diff --git a/omlx/patches/moe_offload_compat.py b/omlx/patches/moe_offload_compat.py
+index a0469b8..c3cb821 100644
+--- a/omlx/patches/moe_offload_compat.py
++++ b/omlx/patches/moe_offload_compat.py
+@@ -11,6 +11,7 @@ _SUPPORTED_TYPES = frozenset(
+     {
+         "deepseek_v41",
+         "deepseek_v4",
++        "inkling2",
+         "qwen4_exp",
+         "qwen3_5_moe",
+         "gemma4",
+@@ -52,6 +53,12 @@ def _inspect(path, signature):
+         if estimate_expert_savings(path, 0.125) > 0:
+             return True, ""
+         return False, "The checkpoint has no offloadable routed experts."
++    if kind == "inkling2":
++        from .inkling2.moe_offload import estimate_inkling2_expert_savings
++
++        if estimate_inkling2_expert_savings(path, 0.125) > 0:
++            return True, ""
++        return False, "The checkpoint has no offloadable routed experts."
+ 
+     from .moe_expert_offload import CheckpointExpertStore, _qwen35_checkpoint_prefix
+ 
+diff --git a/omlx/utils/model_loading.py b/omlx/utils/model_loading.py
+index f690279..d89af58 100644
+--- a/omlx/utils/model_loading.py
++++ b/omlx/utils/model_loading.py
+@@ -571,6 +571,9 @@ def maybe_apply_pre_load_patches(
+                 "moe_expert_offload_resident_fraction": getattr(
+                     model_settings, "moe_expert_offload_resident_fraction", 0.25
+                 ),
++                "prefill_helper_node_id": getattr(
++                    model_settings, "prefill_helper_node_id", None
++                ),
+                 **{
+                     key: getattr(model_settings, key, False)
+                     for key in (
