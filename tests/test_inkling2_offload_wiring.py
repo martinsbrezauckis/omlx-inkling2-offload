@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import mlx.core as mx
 import pytest
@@ -483,8 +486,7 @@ def test_lazy_load_never_materializes_full_experts(tmp_path, layout):
         mx.clear_cache()
 
 
-@pytest.mark.asyncio
-async def test_vlm_engine_load_sequence_offload_and_off_toggle(tmp_path, monkeypatch):
+async def _run_vlm_engine_load_sequence(tmp_path: Path) -> None:
     """Drive real VLMBatchedEngine.start()/stop() on Inkling 2 with offload on/off."""
     from omlx.engine import vlm as vlm_module
     from omlx.engine.vlm import VLMBatchedEngine
@@ -504,93 +506,125 @@ async def test_vlm_engine_load_sequence_offload_and_off_toggle(tmp_path, monkeyp
         lazy_calls.append(bool(lazy))
         return orig_load(path, lazy=lazy)
 
-    monkeypatch.setattr(vlm_module.inkling2_vlm, "load", spy_load)
-
     sched_cfg = SchedulerConfig(max_num_seqs=2)
 
-    # Offload enabled -> lazy=True load -> 6 layers wrapped & materialized cleanly.
-    offload_engine = VLMBatchedEngine(
-        model_name=str(tmp_path),
-        scheduler_config=sched_cfg,
-        model_settings=ModelSettings(
-            moe_expert_offload_enabled=True,
-            moe_expert_offload_resident_fraction=0.25,
-        ),
-    )
-    await offload_engine.start()
-    try:
-        assert lazy_calls[-1] is True
-        assert offload_engine._moe_offload_wrapped == 6
-        assert offload_engine._loaded is True
-        caches = moe_offload_caches(offload_engine._vlm_model)
-        assert len(caches) == 6
-        assert all(c.capacity == 2 for c in caches)
-        for layer in offload_engine._vlm_model.model.layers:
-            assert layer.mlp.experts.w13.weight.shape[0] == 2
-            assert layer.mlp.experts.w2.weight.shape[0] == 2
-        stats = offload_engine._engine.engine.scheduler.moe_offload_stats()
-        assert stats["layers"] == 6
-        assert offload_engine._engine.engine.scheduler.moe_offload_release() == 0
-        assert offload_engine._engine.engine.scheduler.moe_offload_restore() is None
-    finally:
-        if offload_engine._vlm_model is not None:
-            close_inkling2_moe_expert_offload(offload_engine._vlm_model)
-        await offload_engine.stop()
+    with patch.object(vlm_module.inkling2_vlm, "load", spy_load):
+        # Offload enabled -> lazy=True load -> 6 layers wrapped & materialized.
+        offload_engine = VLMBatchedEngine(
+            model_name=str(tmp_path),
+            scheduler_config=sched_cfg,
+            model_settings=ModelSettings(
+                moe_expert_offload_enabled=True,
+                moe_expert_offload_resident_fraction=0.25,
+            ),
+        )
+        await offload_engine.start()
+        try:
+            assert lazy_calls[-1] is True
+            assert offload_engine._moe_offload_wrapped == 6
+            assert offload_engine._loaded is True
+            caches = moe_offload_caches(offload_engine._vlm_model)
+            assert len(caches) == 6
+            assert all(c.capacity == 2 for c in caches)
+            for layer in offload_engine._vlm_model.model.layers:
+                assert layer.mlp.experts.w13.weight.shape[0] == 2
+                assert layer.mlp.experts.w2.weight.shape[0] == 2
+            stats = offload_engine._engine.engine.scheduler.moe_offload_stats()
+            assert stats["layers"] == 6
+            assert offload_engine._engine.engine.scheduler.moe_offload_release() == 0
+            assert offload_engine._engine.engine.scheduler.moe_offload_restore() is None
+        finally:
+            if offload_engine._vlm_model is not None:
+                close_inkling2_moe_expert_offload(offload_engine._vlm_model)
+            await offload_engine.stop()
 
-    # Source layout also loads lazily and wraps cleanly through VLMBatchedEngine.
-    src_dir = tmp_path / "src_vlm"
-    src_formats = (_format_spec("nvfp4"),) * 4 + (_format_spec("mxfp8"),) * 2
-    _save_wiring_checkpoint(
-        src_dir,
-        _build_tiny_model(src_formats, num_experts=8, top_k=2, seed=32),
-        layout="source",
-    )
-    src_engine = VLMBatchedEngine(
-        model_name=str(src_dir),
-        scheduler_config=sched_cfg,
-        model_settings=ModelSettings(
-            moe_expert_offload_enabled=True,
-            moe_expert_offload_resident_fraction=0.25,
-        ),
-    )
-    await src_engine.start()
-    try:
-        assert lazy_calls[-1] is True
-        assert src_engine._moe_offload_wrapped == 6
-        assert len(moe_offload_caches(src_engine._vlm_model)) == 6
-    finally:
-        if src_engine._vlm_model is not None:
-            close_inkling2_moe_expert_offload(src_engine._vlm_model)
-        await src_engine.stop()
+        # Source layout also loads lazily and wraps cleanly through VLMBatchedEngine.
+        src_dir = tmp_path / "src_vlm"
+        src_formats = (_format_spec("nvfp4"),) * 4 + (_format_spec("mxfp8"),) * 2
+        _save_wiring_checkpoint(
+            src_dir,
+            _build_tiny_model(src_formats, num_experts=8, top_k=2, seed=32),
+            layout="source",
+        )
+        src_engine = VLMBatchedEngine(
+            model_name=str(src_dir),
+            scheduler_config=sched_cfg,
+            model_settings=ModelSettings(
+                moe_expert_offload_enabled=True,
+                moe_expert_offload_resident_fraction=0.25,
+            ),
+        )
+        await src_engine.start()
+        try:
+            assert lazy_calls[-1] is True
+            assert src_engine._moe_offload_wrapped == 6
+            assert len(moe_offload_caches(src_engine._vlm_model)) == 6
+        finally:
+            if src_engine._vlm_model is not None:
+                close_inkling2_moe_expert_offload(src_engine._vlm_model)
+            await src_engine.stop()
 
-    # Load-time rejection fires in VLMBatchedEngine.start() BEFORE loading weights.
-    calls_before = len(lazy_calls)
-    bad_engine = VLMBatchedEngine(
-        model_name=str(tmp_path),
-        scheduler_config=sched_cfg,
-        model_settings=ModelSettings(
-            moe_expert_offload_enabled=True,
-            prefill_helper_node_id="helper-mac",
-        ),
-    )
-    with pytest.raises(ValueError, match="Prefill Accelerator"):
-        await bad_engine.start()
-    assert len(lazy_calls) == calls_before
+        # Load-time rejection fires in VLMBatchedEngine.start() BEFORE loading weights.
+        calls_before = len(lazy_calls)
+        bad_engine = VLMBatchedEngine(
+            model_name=str(tmp_path),
+            scheduler_config=sched_cfg,
+            model_settings=ModelSettings(
+                moe_expert_offload_enabled=True,
+                prefill_helper_node_id="helper-mac",
+            ),
+        )
+        with pytest.raises(ValueError, match="Prefill Accelerator"):
+            await bad_engine.start()
+        assert len(lazy_calls) == calls_before
 
-    # Offload disabled -> eager load (lazy=False) -> 0 wrapped layers.
-    eager_engine = VLMBatchedEngine(
-        model_name=str(tmp_path),
-        scheduler_config=sched_cfg,
-        model_settings=ModelSettings(moe_expert_offload_enabled=False),
+        # Offload disabled -> eager load (lazy=False) -> 0 wrapped layers.
+        eager_engine = VLMBatchedEngine(
+            model_name=str(tmp_path),
+            scheduler_config=sched_cfg,
+            model_settings=ModelSettings(moe_expert_offload_enabled=False),
+        )
+        await eager_engine.start()
+        try:
+            assert lazy_calls[-1] is False
+            assert eager_engine._moe_offload_wrapped == 0
+            for layer in eager_engine._vlm_model.model.layers:
+                assert layer.mlp.experts.w13.weight.shape[0] == 8
+        finally:
+            await eager_engine.stop()
+
+
+def test_vlm_engine_load_sequence_offload_and_off_toggle(tmp_path):
+    """Isolate real VLMBatchedEngine.start()/stop() patches in a subprocess.
+
+    VLMBatchedEngine.start() installs process-wide Metal/attention/model patches
+    (sdpa256/fa256, qwen35_gdn_prework, qwen35_q4_mlp) that stop() does not undo.
+    Keep those real hooks in a subprocess so unrelated unit tests see stock hooks.
+    """
+    script = """
+import asyncio
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+import tests.test_inkling2_offload_wiring as t
+
+coro = t._run_vlm_engine_load_sequence(Path(sys.argv[2]))
+asyncio.run(asyncio.wait_for(coro, timeout=60))
+"""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(Path(__file__).resolve().parent.parent),
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
-    await eager_engine.start()
-    try:
-        assert lazy_calls[-1] is False
-        assert eager_engine._moe_offload_wrapped == 0
-        for layer in eager_engine._vlm_model.model.layers:
-            assert layer.mlp.experts.w13.weight.shape[0] == 8
-    finally:
-        await eager_engine.stop()
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_estimator_exact_parity_runtime_source_and_skipped_layers(tmp_path):
