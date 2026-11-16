@@ -30,7 +30,7 @@ python3 install.py --omlx /path/to/omlx --uninstall
 ## Settings
 
 | Scope | Setting | Value | Fact |
-| --- | --- | --- | --- |
+| --- | --- | --- |
 | `model_settings` | `moe_expert_offload_enabled` | `true` | Routed-expert offload |
 | `model_settings` | `moe_expert_offload_resident_fraction` | `0.55` | Resident expert fraction |
 | `model_settings` | `mtp_enabled` | `false` | Required with offload |
@@ -76,12 +76,10 @@ PYTHONPATH="$PWD" /path/to/venv/bin/python -m pytest -q -p no:cacheprovider \
 - Model: Inkling-2-Small oQ4e, 318 GB; 55 % of routed experts resident.
 - Generation tok/s = completion tokens / generation time; prompt tok/s = uncached prompt tokens / prompt time.
 
-| Workload | Version | Prompt tok/s | Generation tok/s |
-| --- | --- | --- | --- |
-| Replay, 27 recorded agentic requests | 0.1.0 (50 % resident) | 97.2 | 10.51 |
-| Replay, 27 recorded agentic requests | 0.2.0 | 229.6 | 12.49 |
-| Agentic coding run, first 123 requests | 0.1.0 (50 % resident) | 71.9 | 10.99 |
-| Agentic coding run, first 123 requests | 0.2.0 | 130.7 | 11.90 |
+| Workload | Prompt tok/s | Generation tok/s |
+| --- | --- | --- |
+| Replay, 27 recorded agentic requests | 229.6 | 12.49 |
+| Agentic coding run, first 123 requests | 130.7 | 11.90 |
 
 ## Limits
 
