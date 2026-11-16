@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Over-capacity prefill must not evict the decode working set (S8)."""
+"""Over-capacity prefill must not evict the decode working set."""
 
 from __future__ import annotations
 
@@ -98,6 +98,6 @@ def test_switch_off_restores_install_path(tmp_path, monkeypatch):
         mx.random.seed(77)
         mx.eval(offloaded(mx.random.randint(0, 300, (1, 48))))
         after = [sorted(c.slot_of) for c in caches]
-        assert after != before  # v0.1 behaviour installs prefill experts
+        assert after != before  # the 0.1.0 path installs prefill experts
     finally:
         close_inkling2_moe_expert_offload(offloaded)

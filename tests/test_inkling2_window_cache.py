@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Tests for window-bounded RotatingKVCache on Inkling 2 sliding layers (S7)."""
+"""Tests for window-bounded RotatingKVCache on Inkling 2 sliding layers."""
 
 from __future__ import annotations
 

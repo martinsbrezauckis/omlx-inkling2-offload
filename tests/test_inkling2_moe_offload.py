@@ -311,7 +311,7 @@ def test_source_layout_helper_roundtrips_through_sanitize_weights(tmp_path):
 @pytest.mark.parametrize("fmt", ["mxfp8", "nvfp4", "affine"])
 @pytest.mark.parametrize("residency", [1.0, 0.5, 0.25])
 def test_runtime_formats_and_residencies_decode_batch_verify(tmp_path, fmt, residency):
-    """Decode, batch=2 and verify T=4..16 match S1 split bit-for-bit."""
+    """Decode, batch=2 and verify T=4..16 match the split path bit-for-bit."""
     formats = (_format_spec(fmt),) * 6
     stock_fused = _build_tiny_model(formats, num_experts=8, top_k=2)
     _save_runtime_checkpoint(tmp_path, stock_fused)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Tests for S1 separable routed-expert stage in Inkling 2."""
+"""Tests for the separable routed-expert stage in Inkling 2."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ def _frozen_experts_call(
     inds: mx.array,
     weights: mx.array,
 ) -> mx.array:
-    """Frozen pre-S1 Inkling2Experts.__call__ body used as reference."""
+    """Frozen pre-split Inkling2Experts.__call__ body used as reference."""
     xe = mx.expand_dims(x, (-2, -3))
     do_sort = inds.size >= 64
     idx = inds

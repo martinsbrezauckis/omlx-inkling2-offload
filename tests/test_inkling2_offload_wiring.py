@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Wiring tests for Inkling 2 MoE expert offload (step S3)."""
+"""Wiring tests for Inkling 2 MoE expert offload."""
 
 from __future__ import annotations
 

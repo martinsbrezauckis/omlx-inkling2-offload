@@ -12,7 +12,7 @@ An eager :class:`OffloadedInkling2Experts` callable is installed onto
 ``layer._split_experts`` so the layer runs its compiled ``_post_attn`` stage,
 this host-coordinated expert stage, and its compiled ``_post_tail`` stage.
 In-capacity calls remap expert ids to slot ids and run ``routes()`` and
-``combine()`` directly (bit-identical to the S1 split path). Over-capacity
+``combine()`` directly (bit-identical to the split stock path). Over-capacity
 prefills run expert-major chunks (resident experts first, each expert installed
 at most once per call, each chunk evaluated before the next overwrites slots,
 and the next chunk read ahead on the shared IO pool).
@@ -174,7 +174,7 @@ def _prefill_cache_scope():
 # computes non-resident experts from temporary stacks of PREFILL_GROUP experts and
 # never installs them, so a prompt does not evict the decode working set. Resident
 # experts still run from their slots. OMLX_INKLING2_PREFILL_NO_EVICT=0 restores the
-# v0.1 behaviour (install every routed expert in capacity-sized chunks).
+# 0.1.0 behaviour (install every routed expert in capacity-sized chunks).
 PREFILL_GROUP = max(1, int(os.environ.get("OMLX_INKLING2_PREFILL_GROUP", "32")))
 PREFILL_NO_EVICT = os.environ.get("OMLX_INKLING2_PREFILL_NO_EVICT", "1") != "0"
 # Current-group payload plus read-ahead; allow one whole compute group even
