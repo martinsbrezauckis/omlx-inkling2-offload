@@ -1,8 +1,5 @@
 MIT License
 
-Covers module/, tests/, install.py, and documentation (README.md, CHANGELOG.md).
-See NOTICE and LICENSES/Apache-2.0.txt for patches/omlx-624cff0e.patch.
-
 Copyright (c) 2026 Martins Brezauckis
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
