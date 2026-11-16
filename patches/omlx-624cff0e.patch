@@ -479,7 +479,7 @@ index 621e17f..7e076cd 100644
              for slot in range(_CONV_SLOTS):
                  value = state.get(f"{i}.c{slot}")
 diff --git a/omlx/scheduler.py b/omlx/scheduler.py
-index d567696..50dc0f3 100644
+index d567696..72dda95 100644
 --- a/omlx/scheduler.py
 +++ b/omlx/scheduler.py
 @@ -16,6 +16,7 @@ import copy
@@ -558,6 +558,27 @@ index d567696..50dc0f3 100644
          if self.config.paged_cache_block_size != target_block_size:
              logger.info(
                  "Aligning paged cache block_size=%s to %s "
+@@ -6452,6 +6491,10 @@ class Scheduler:
+         Returns:
+             ``max(active, phys_footprint)`` after reclaim.
+         """
++        # Direct-read expert buffers are live arrays, outside MLX's cache.
++        from .patches.inkling2.moe_offload import clear_inkling2_prefill_buffers
++
++        clear_inkling2_prefill_buffers()
+         Scheduler._clear_cache(self)
+         return self._current_usage_bytes()
+ 
+@@ -12346,6 +12389,9 @@ class Scheduler:
+         if not self._pending_pressure_clear:
+             return False
+         self._pending_pressure_clear = False
++        from .patches.inkling2.moe_offload import clear_inkling2_prefill_buffers
++
++        clear_inkling2_prefill_buffers()
+         return True
+ 
+     def _process_pending_reclaim(self) -> None:
 diff --git a/omlx/utils/model_loading.py b/omlx/utils/model_loading.py
 index f690279..d89af58 100644
 --- a/omlx/utils/model_loading.py

@@ -52,6 +52,8 @@ def _prefill(cache):
 def test_exception_drains_every_submitted_read(slot_cache, monkeypatch, path, failure):
     """A running read in a popped group must finish before closing its store."""
     cache = slot_cache
+    # These injections exercise the retained bytes/conversion path.
+    monkeypatch.setattr(mo, "ZERO_COPY", False)
     monkeypatch.setattr(mo, "PREFILL_GROUP", 2)
     started, release = Event(), Event()
     submitted = []
@@ -122,6 +124,7 @@ def test_prefill_byte_cap_preserves_compute_groups(
     slot_cache, monkeypatch, budget_experts
 ):
     cache = slot_cache
+    monkeypatch.setattr(mo, "ZERO_COPY", False)
     group_size = 2
     monkeypatch.setattr(mo, "PREFILL_GROUP", group_size)
     monkeypatch.setattr(

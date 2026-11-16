@@ -10,7 +10,7 @@ Routed-expert SSD offload for Inkling 2 Small in oMLX 0.8.0rc1 (main 624cff0e).
 - oMLX runtime: Python >= 3.11, < 3.14; installed oMLX dependencies and native kernels.
 - RAM: tested on 256 GB.
 - Model: [mlx-community/Inkling-2-Small-oQ4e](https://huggingface.co/mlx-community/Inkling-2-Small-oQ4e) (318 GB).
-- Package version: `0.2.0`.
+- Package version: `0.2.1`.
 
 ## Install / check / uninstall
 
@@ -21,7 +21,7 @@ python3 install.py --omlx /path/to/omlx --check
 python3 install.py --omlx /path/to/omlx --uninstall
 ```
 
-- Exact SHA-256 verification: 8 patched files, 2 replaced fixtures, 14 added files.
+- Exact SHA-256 verification: 8 patched files, 2 replaced fixtures, 16 added files.
 - Original fixture bytes: compressed backups in `.omlx-inkling2-offload-record.json`.
 - Double install: refused.
 - Modified files: `--check` exits 1; install/uninstall refuse changes.
@@ -45,6 +45,8 @@ python3 install.py --omlx /path/to/omlx --uninstall
 | Optional environment | `OMLX_INKLING2_PREFILL_NO_EVICT` | `1` | Default; preserve resident experts during prefill |
 | Optional environment | `OMLX_INKLING2_PREFILL_GROUP` | `32` | Default; experts per compute group |
 | Optional environment | `OMLX_INKLING2_PREFILL_IO_MB` | `2048` | Default; MiB; minimum one compute group |
+| Optional environment | `OMLX_INKLING2_ZERO_COPY` | `1` | Default; `0` uses the read-convert-stack path |
+| Optional environment | `OMLX_INKLING2_ZERO_COPY_POOL_MB` | `2560` | Default; MiB of reusable prefill buffers; `0` disables reuse |
 
 ```bash
 export OMLX_PREFILL_STEP_SIZE=8192
@@ -78,8 +80,8 @@ PYTHONPATH="$PWD" /path/to/venv/bin/python -m pytest -q -p no:cacheprovider \
 
 | Workload | Prompt tok/s | Generation tok/s |
 | --- | --- | --- |
-| Replay, 27 recorded agentic requests | 229.6 | 12.49 |
-| Agentic coding run, first 123 requests | 130.7 | 11.90 |
+| Replay, 27 recorded agentic requests | 261.7 | 12.40 |
+| Agentic coding run, 1.5 h segment (49 requests, up to 111K context) | 248.3 | 12.43 |
 
 ## Limits
 
@@ -114,6 +116,8 @@ PYTHONPATH="$PWD" /path/to/venv/bin/python -m pytest -q -p no:cacheprovider \
 | Copied | `tests/test_inkling2_prefill_no_evict.py` | MIT |
 | Copied | `tests/test_inkling2_split_experts.py` | MIT |
 | Copied | `tests/test_inkling2_window_cache.py` | MIT |
+| Copied | `tests/test_inkling2_zero_copy.py` | MIT |
+| Copied | `tests/test_inkling2_zero_copy_pool.py` | MIT |
 | Copied | `tests/test_moe_io_workers_env.py` | MIT |
 | Copied | `tests/test_scheduler_prefill_step_size.py` | Apache-2.0 |
 | Copied | `tests/test_scheduler_rotating_arrays_block.py` | MIT |

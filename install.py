@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 PACKAGE_NAME = "omlx-inkling2-offload"
-PACKAGE_VERSION = "0.2.0"
+PACKAGE_VERSION = "0.2.1"
 UPSTREAM_COMMIT = "624cff0e23519ba46a4d5ed2802c2c236ad1a9ac"
 UPSTREAM_SHORT = "624cff0e"
 RECORD_FILENAME = ".omlx-inkling2-offload-record.json"
@@ -44,7 +44,7 @@ PATCHED_SHA256: dict[str, str] = {
     "omlx/patches/moe_expert_offload.py": "179d0e1ec6a9acebc3eb9d6c418d444b632c60f2ca0f27c6a56e6f48a3212cf1",
     "omlx/patches/moe_offload_compat.py": "93a58442ae7979c1ba4c6fc937f760d34b66dd48fa2dfda1e5c48e00b1afd9cb",
     "omlx/prefill_helper/adapters/inkling2.py": "3f3af8a08df2940baf0c9dc8e859e1a13d60d0016314decfb4294b2d6c79990e",
-    "omlx/scheduler.py": "d83252b68fc063effcb8f7ecc55b3922ba8579b6135b8d84ca0a147cd3e8b043",
+    "omlx/scheduler.py": "1826ca6402fd89cff885dc56e2bfc1a7730d9e2363e60dd86f7d47392120f4ae",
     "omlx/utils/model_loading.py": "b52639d54e7fb027cfbfaddf2c81b8852147fd9f68708824a0dc5a9d071eabd9",
 }
 
@@ -72,6 +72,8 @@ COPIED_FILES: dict[str, str] = {
     "tests/test_inkling2_prefill_no_evict.py": "tests/test_inkling2_prefill_no_evict.py",
     "tests/test_inkling2_split_experts.py": "tests/test_inkling2_split_experts.py",
     "tests/test_inkling2_window_cache.py": "tests/test_inkling2_window_cache.py",
+    "tests/test_inkling2_zero_copy.py": "tests/test_inkling2_zero_copy.py",
+    "tests/test_inkling2_zero_copy_pool.py": "tests/test_inkling2_zero_copy_pool.py",
     "tests/test_moe_io_workers_env.py": "tests/test_moe_io_workers_env.py",
     "tests/test_scheduler_prefill_step_size.py": "tests/test_scheduler_prefill_step_size.py",
     "tests/test_scheduler_rotating_arrays_block.py": "tests/test_scheduler_rotating_arrays_block.py",

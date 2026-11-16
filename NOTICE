@@ -1,4 +1,4 @@
-omlx-inkling2-offload 0.2.0
+omlx-inkling2-offload 0.2.1
 Copyright (c) 2026 Martins Brezauckis
 
 MIT License (see LICENSE):
@@ -13,6 +13,8 @@ MIT License (see LICENSE):
   - tests/test_inkling2_prefill_no_evict.py
   - tests/test_inkling2_split_experts.py
   - tests/test_inkling2_window_cache.py
+  - tests/test_inkling2_zero_copy.py
+  - tests/test_inkling2_zero_copy_pool.py
   - tests/test_moe_io_workers_env.py
   - tests/test_scheduler_rotating_arrays_block.py
   - install.py

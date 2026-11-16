@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1 (2026-11-17)
+
+- Streamed experts read directly into reusable GPU buffers.
+- Prefill buffer pool across calls.
+
 ## 0.2.0 (2026-11-16)
 
 - Decode read/compute overlap.

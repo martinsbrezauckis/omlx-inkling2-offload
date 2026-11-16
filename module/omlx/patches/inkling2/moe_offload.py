@@ -32,6 +32,7 @@ import os
 import struct
 import threading
 import time
+import weakref
 from concurrent.futures import FIRST_COMPLETED, wait
 from contextlib import contextmanager
 from pathlib import Path
@@ -130,18 +131,34 @@ def _tflush() -> None:
     gb = t.get("em_bytes", 0) / 1e9
     logger.info(
         "Inkling2 offload timing: wall=%.1fs em_wall=%.1fs (calls=%d groups=%d "
-        "read_wait=%.1fs convert=%.1fs res_eval=%.1fs grp_eval=%.1fs plan=%.1fs "
+        "read_wait=%.1fs convert=%.1fs buffer=%.1fs (alloc=%d reuse=%d) res_eval=%.1fs "
+        "grp_eval=%.1fs plan=%.1fs "
         "read=%.1fGB %.1fGB/s) dec_wall=%.1fs (calls=%d sync=%.1fs ensure=%.1fs "
         "misses=%d overlap_calls=%d res_eval=%.3fs read_wait=%.3fs "
         "miss_eval=%.3fs install=%.3fs) ",
-        wall, em, t.get("em_calls", 0), t.get("em_groups", 0),
-        t.get("em_read_wait", 0.0), t.get("em_convert", 0.0),
-        t.get("em_res_eval", 0.0), t.get("em_grp_eval", 0.0), t.get("em_plan", 0.0),
-        gb, gb / em if em else 0.0,
-        t.get("dec_wall", 0.0), t.get("dec_calls", 0), t.get("dec_sync", 0.0),
-        t.get("dec_ensure", 0.0), t.get("dec_misses", 0),
-        t.get("dec_overlap_calls", 0), t.get("dec_overlap_res_eval", 0.0),
-        t.get("dec_overlap_read_wait", 0.0), t.get("dec_overlap_miss_eval", 0.0),
+        wall,
+        em,
+        t.get("em_calls", 0),
+        t.get("em_groups", 0),
+        t.get("em_read_wait", 0.0),
+        t.get("em_convert", 0.0),
+        t.get("em_buffer", 0.0),
+        t.get("em_buffer_allocations", 0),
+        t.get("em_buffer_reuses", 0),
+        t.get("em_res_eval", 0.0),
+        t.get("em_grp_eval", 0.0),
+        t.get("em_plan", 0.0),
+        gb,
+        gb / em if em else 0.0,
+        t.get("dec_wall", 0.0),
+        t.get("dec_calls", 0),
+        t.get("dec_sync", 0.0),
+        t.get("dec_ensure", 0.0),
+        t.get("dec_misses", 0),
+        t.get("dec_overlap_calls", 0),
+        t.get("dec_overlap_res_eval", 0.0),
+        t.get("dec_overlap_read_wait", 0.0),
+        t.get("dec_overlap_miss_eval", 0.0),
         t.get("dec_overlap_install", 0.0),
     )
 
@@ -170,6 +187,7 @@ def _prefill_cache_scope():
                 mx.set_cache_limit(_cache_scope_saved)
                 _cache_scope_saved = None
 
+
 # Over-capacity prefill (a prompt chunk touching more experts than the cache holds)
 # computes non-resident experts from temporary stacks of PREFILL_GROUP experts and
 # never installs them, so a prompt does not evict the decode working set. Resident
@@ -177,11 +195,259 @@ def _prefill_cache_scope():
 # 0.1.0 behaviour (install every routed expert in capacity-sized chunks).
 PREFILL_GROUP = max(1, int(os.environ.get("OMLX_INKLING2_PREFILL_GROUP", "32")))
 PREFILL_NO_EVICT = os.environ.get("OMLX_INKLING2_PREFILL_NO_EVICT", "1") != "0"
+# MLX's writable buffer export shares unified memory. Writers only receive
+# materialized transport buffers; the owning thread evaluates every consumer
+# before advancing the pipeline and allowing a buffer to be reused.
+ZERO_COPY = os.environ.get("OMLX_INKLING2_ZERO_COPY", "1") != "0"
+# These are live arrays, independent of MLX's allocator cache limit. Count
+# checked-out buffers as well as idle buffers against this process-wide cap.
+# Excess concurrent demand uses temporary storage, as in the unpooled path.
+ZERO_COPY_POOL_BYTES = max(
+    0, int(float(os.environ.get("OMLX_INKLING2_ZERO_COPY_POOL_MB", "2560")) * (1 << 20))
+)
 # Current-group payload plus read-ahead; allow one whole compute group even
 # below this budget so gathering and reduction order never depend on IO sizing.
 PREFILL_IO_BYTES = int(
     float(os.environ.get("OMLX_INKLING2_PREFILL_IO_MB", "2048")) * (1 << 20)
 )
+
+
+def _read_into(plan, dest: memoryview) -> None:
+    """Read a complete slab into owned storage without bytes or MLX on workers."""
+    if dest.nbytes != plan.nbytes or dest.readonly or not dest.c_contiguous:
+        raise ValueError(
+            "expert destination must be writable, contiguous, and slab-sized"
+        )
+    dest = dest.cast("B")
+    got = 0
+    while got < plan.nbytes:
+        try:
+            n = os.preadv(plan.fd, [dest[got:]], plan.offset + got)
+        except InterruptedError:
+            continue
+        if not n:
+            raise OSError(f"short read of {plan.nbytes} bytes at {plan.offset}")
+        got += n
+
+
+class _PrefillBuffer:
+    """One dense group, exported in transport dtype before any reader starts."""
+
+    def __init__(self, cache, count, plans):
+        self.arrays = {}
+        self.host = {}
+        for write, plan in plans:
+            # BF16 travels as uint16; source U8/F8 weights need a uint32 view.
+            # Apply exactly the same bit views as to_slot_array, never casts.
+            owner = mx.empty(
+                (count, *plan.shape), dtype=getattr(mx, np.dtype(plan.np_dtype).name)
+            )
+            array = owner.view(plan.mx_view) if plan.mx_view is not None else owner
+            if cache.view.source_layout and write[1] == "weight":
+                array = array.view(mx.uint32)
+            mx.eval(owner, array)
+            host = memoryview(owner)
+            if host.readonly or not host.c_contiguous:
+                raise RuntimeError("MLX did not export a writable dense expert buffer")
+            self.arrays[write] = array
+            # Keep both the allocation and its writable export alive through
+            # all GPU consumers. Workers receive disjoint byte ranges only.
+            self.host[write] = host.cast("B")
+
+    def destination(self, write, plan, index):
+        return self.host[write][index * plan.nbytes : (index + 1) * plan.nbytes]
+
+    def fields(self, count):
+        # The odd tail must keep its original leading dimension: padding it
+        # would change the sorted gather_qmm kernel selection and rounding.
+        return {
+            w: a if a.shape[0] == count else a[:count] for w, a in self.arrays.items()
+        }
+
+
+class _PrefillBufferPool:
+    """At most two buffers per layout, with exclusive leases until evaluation."""
+
+    def __init__(self):
+        # A store finalizer can clear the pool during Python garbage collection
+        # on this thread, including while constructing another buffer.
+        self._lock = threading.RLock()
+        self._entries = {}
+        self._idle = {}
+        self.nbytes = 0
+
+    @staticmethod
+    def _key(cache, count, plans):
+        # Offsets, descriptors, and layer ids are payload, not layout. Include
+        # both transport and compute views, even when their byte sizes match.
+        return count, tuple(
+            (
+                write,
+                tuple(plan.shape),
+                np.dtype(plan.np_dtype).str,
+                str(plan.mx_view),
+                cache.view.source_layout and write[1] == "weight",
+                plan.nbytes,
+            )
+            for write, plan in plans
+        )
+
+    @staticmethod
+    def _allocate(cache, count, plans):
+        start = time.perf_counter() if TIMING else 0
+        buffer = _PrefillBuffer(cache, count, plans)
+        if TIMING:
+            _tadd("em_buffer", start)
+            _tcount("em_buffer_allocations")
+        return buffer
+
+    def _discard(self, buffer):
+        self._idle.pop(buffer, None)
+        _, size = self._entries.pop(buffer)
+        self.nbytes -= size
+
+    def acquire(self, cache, count, plans):
+        with self._lock:
+            limit = ZERO_COPY_POOL_BYTES
+            if limit <= 0:
+                self.clear()
+                return self._allocate(cache, count, plans)
+            while self._idle and self.nbytes > limit:
+                self._discard(next(iter(self._idle)))
+            key = self._key(cache, count, plans)
+            for buffer in self._idle:
+                if self._entries[buffer][0] == key:
+                    del self._idle[buffer]
+                    if TIMING:
+                        _tcount("em_buffer_reuses")
+                    return buffer
+            size = count * sum(plan.nbytes for _, plan in plans)
+            retain = (
+                size <= limit and sum(k == key for k, _ in self._entries.values()) < 2
+            )
+            if retain:
+                while self._idle and self.nbytes + size > limit:
+                    self._discard(next(iter(self._idle)))
+                retain = self.nbytes + size <= limit
+            buffer = self._allocate(cache, count, plans)
+            if retain:
+                self._entries[buffer] = key, size
+                self.nbytes += size
+            return buffer
+
+    def release(self, buffer, *, reusable=True):
+        with self._lock:
+            # A close/pressure clear forgets outstanding leases. Their owners
+            # keep them alive, but cannot return them to the pool afterwards.
+            if buffer not in self._entries:
+                return
+            if not reusable or self.nbytes > ZERO_COPY_POOL_BYTES:
+                self._discard(buffer)
+            else:
+                self._idle[buffer] = None
+
+    def clear(self):
+        with self._lock:
+            self._idle.clear()
+            self._entries.clear()
+            self.nbytes = 0
+
+
+_prefill_buffers = _PrefillBufferPool()
+
+
+def clear_inkling2_prefill_buffers() -> None:
+    """Drop retained live arrays before unload or a pressure-driven MLX clear."""
+    _prefill_buffers.clear()
+
+
+def _zero_copy_groups(cache, groups):
+    """Yield direct-read stacks; advance only after mx.eval of the group output.
+
+    The byte window counts current payload plus prefetched payload, just like
+    the bytes path. At most two dense groups are reserved; unfilled capacity
+    is not read-ahead. With no read-ahead allowance, one allocation suffices.
+    """
+    if not groups:
+        return
+    pool = _io_pool()
+    window = max(PREFILL_GROUP, PREFILL_IO_BYTES // max(1, cache.expert_bytes))
+    count = 2 if pool is not None and window > len(groups[0]) and len(groups) > 1 else 1
+    buffers = []
+    complete = False
+    reads = set()
+    pending = {}
+    # Use the first actual read's metadata for both buffer layouts. Planning
+    # expert 0 separately would duplicate work and could describe a resident
+    # expert that this call never needs to read.
+    first_expert = groups[0][0]
+    first_plans = cache._plans(first_expert)
+
+    def plans(e):
+        return first_plans if e == first_expert else cache._plans(e)
+
+    def buffer(index):
+        slot = index % count
+        if slot == len(buffers):
+            # Full-capacity buffers can serve tails without changing the
+            # compute shape. Disabling reuse keeps per-call allocation sizes.
+            capacity = PREFILL_GROUP if ZERO_COPY_POOL_BYTES > 0 else len(groups[index])
+            buffers.append(_prefill_buffers.acquire(cache, capacity, first_plans))
+        return buffers[slot]
+
+    def submit(group, target, into, limit):
+        if pool is not None:
+            for index, e in enumerate(group[:limit]):
+                if e not in into:
+                    parts = []
+                    for write, plan in plans(e):
+                        future = pool.submit(
+                            _read_into, plan, target.destination(write, plan, index)
+                        )
+                        # A later submit may fail before this expert is added
+                        # to pending. Register ownership immediately.
+                        reads.add(future)
+                        parts.append((write, plan, future))
+                    into[e] = parts
+
+    try:
+        for gi, group in enumerate(groups):
+            target = buffer(gi)
+            current = pending
+            submit(group, target, current, len(group))
+            pending = {}
+            if count == 2 and gi + 1 < len(groups):
+                submit(groups[gi + 1], buffer(gi + 1), pending, window - len(group))
+            for index, e in enumerate(group):
+                parts = current.pop(e, None)
+                if parts is None:
+                    parts = [(w, p, None) for w, p in plans(e)]
+                for write, plan, future in parts:
+                    start = time.perf_counter() if TIMING else 0
+                    if future is None:
+                        _read_into(plan, target.destination(write, plan, index))
+                    else:
+                        future.result()
+                        reads.remove(future)
+                    if TIMING:
+                        _tadd("em_read_wait", start)
+                        _tcount("em_bytes", plan.nbytes)
+                    cache.fetched_bytes += plan.nbytes
+                cache.misses += 1
+            yield target.fields(len(group))
+            # The caller's output evaluation is the reuse barrier. Evaluating
+            # the buffer itself would not wait for its GPU readers.
+        complete = True
+    finally:
+        drained = False
+        try:
+            _drain_futures(reads)
+            drained = True
+        finally:
+            for target in buffers:
+                # close() while suspended at a yield may leave an unevaluated
+                # consumer. Only normal exhaustion certifies all group barriers.
+                _prefill_buffers.release(target, reusable=complete and drained)
 
 
 class _TempProj:
@@ -217,6 +483,7 @@ class _TempExperts:
 
     routes = Inkling2Experts.routes
 
+
 # MLX 0.32.4 GPU gather_qmm(..., sorted_indices=True) with M=1 switches to the
 # segmented sorted kernel iff routes >= max(16, 4 * weight.shape[0]) across
 # affine, nvfp4, and mxfp8.
@@ -247,6 +514,7 @@ def _is_expert_proj(proj) -> bool:
 
 def _close_store(store: CheckpointExpertStore | None) -> int:
     """Close any open shard file descriptors held by ``store`` (idempotent)."""
+    clear_inkling2_prefill_buffers()
     fds = getattr(store, "_fds", None)
     if not fds:
         return 0
@@ -517,6 +785,12 @@ class _SlotCache:
     ):
         self.experts = experts
         self.view = view
+        # The engine also unloads by dropping the model/store rather than
+        # calling close(). Do not keep the store alive through this callback.
+        if not hasattr(view.store, "_inkling2_pool_finalizer"):
+            view.store._inkling2_pool_finalizer = weakref.finalize(
+                view.store, clear_inkling2_prefill_buffers
+            )
         self.n_experts = experts.w13.weight.shape[0]
         self.capacity = min(capacity, self.n_experts)
         self.resident: dict[str, list] = {}
@@ -902,54 +1176,63 @@ class OffloadedInkling2Experts(nn.Module):
                         into[e] = c._submit(pool, e, reads)
 
         pending = {}
+        direct = _zero_copy_groups(c, groups) if ZERO_COPY else None
         try:
-            if groups:
+            if groups and direct is None:
                 submit(groups[0], pending)
             for gi, group in enumerate(groups):
-                current = pending
-                # Complete a partially prefetched group without changing its
-                # compute shape, then spend the remaining bytes on read-ahead.
-                submit(group, current)
-                pending = {}
-                if gi + 1 < len(groups):
-                    submit(groups[gi + 1][: window - len(group)], pending)
-                stacks: dict = {}
-                for e in group:
-                    parts = current.pop(e, None)
-                    if parts is None:
-                        parts = [(w, plan, None) for w, plan in c._plans(e)]
-                    for (proj_name, field), plan, fut in parts:
-                        if TIMING:
-                            tr = time.perf_counter()
-                        raw = (
-                            fut.result()
-                            if fut is not None
-                            else CheckpointExpertStore.read(plan)
-                        )
-                        if fut is not None:
-                            # Release consumed futures so the registry does not
-                            # retain every expert's raw payload until call exit.
-                            reads.remove(fut)
-                        if TIMING:
-                            _tadd("em_read_wait", tr)
-                            tr = time.perf_counter()
-                        stacks.setdefault((proj_name, field), []).append(
-                            c.view.to_slot_array(field, plan, raw)
-                        )
-                        if TIMING:
-                            _tadd("em_convert", tr)
-                            _tcount("em_bytes", plan.nbytes)
-                        c.fetched_bytes += plan.nbytes
-                    c.misses += 1
-                    # Do not carry the last consumed expert's bytes into the
-                    # next group's submission window through these locals.
-                    del parts, raw, fut
+                if direct is not None:
+                    stacks = next(direct)
+                else:
+                    current = pending
+                    # Complete a partially prefetched group without changing its
+                    # compute shape, then spend the remaining bytes on read-ahead.
+                    submit(group, current)
+                    pending = {}
+                    if gi + 1 < len(groups):
+                        submit(groups[gi + 1][: window - len(group)], pending)
+                    stacks: dict = {}
+                    for e in group:
+                        parts = current.pop(e, None)
+                        if parts is None:
+                            parts = [(w, plan, None) for w, plan in c._plans(e)]
+                        for (proj_name, field), plan, fut in parts:
+                            if TIMING:
+                                tr = time.perf_counter()
+                            raw = (
+                                fut.result()
+                                if fut is not None
+                                else CheckpointExpertStore.read(plan)
+                            )
+                            if fut is not None:
+                                # Release consumed futures so the registry does not
+                                # retain every expert's raw payload until call exit.
+                                reads.remove(fut)
+                            if TIMING:
+                                _tadd("em_read_wait", tr)
+                                tr = time.perf_counter()
+                            stacks.setdefault((proj_name, field), []).append(
+                                c.view.to_slot_array(field, plan, raw)
+                            )
+                            if TIMING:
+                                _tadd("em_convert", tr)
+                                _tcount("em_bytes", plan.nbytes)
+                            c.fetched_bytes += plan.nbytes
+                        c.misses += 1
+                        # Do not carry the last consumed expert's bytes into the
+                        # next group's submission window through these locals.
+                        del parts, raw, fut
                 gidx = mx.array(group, dtype=mx.int32)
                 projs = {}
                 for proj_name in _PROJS:
                     src = getattr(c.experts, proj_name)
                     fields = {
-                        f: mx.stack(stacks[(proj_name, f)]) for f in _fields(src)
+                        f: (
+                            stacks[(proj_name, f)]
+                            if direct is not None
+                            else mx.stack(stacks[(proj_name, f)])
+                        )
+                        for f in _fields(src)
                     }
                     if proj_name in c.global_scales:
                         fields["global_scale"] = c.global_scales[proj_name][gidx]
@@ -969,7 +1252,14 @@ class OffloadedInkling2Experts(nn.Module):
                     _tcount("em_groups")
                 outs.append(o)
                 del stacks, projs, temp
+            if direct is not None:
+                # Every outs entry is evaluated, including the last group.
+                # Its graph no longer reads expert buffers; the lazy final
+                # concatenate/take/combine below reads only these outputs.
+                next(direct, None)
         finally:
+            if direct is not None:
+                direct.close()
             _drain_futures(reads)
         out = mx.concatenate(outs, axis=0)
         inverse = mx.array(np.argsort(order, kind="stable"), dtype=mx.int32)
