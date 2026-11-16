@@ -18,65 +18,68 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 PACKAGE_NAME = "omlx-inkling2-offload"
-PACKAGE_VERSION = "0.1.0"
+PACKAGE_VERSION = "0.2.0"
 UPSTREAM_COMMIT = "624cff0e23519ba46a4d5ed2802c2c236ad1a9ac"
 UPSTREAM_SHORT = "624cff0e"
 RECORD_FILENAME = ".omlx-inkling2-offload-record.json"
 PATCH_REL_PATH = Path("patches/omlx-624cff0e.patch")
 
-# Expected SHA-256 digests of the 6 upstream files at commit 624cff0e.
+# Expected SHA-256 digests of upstream text files at commit 624cff0e.
 UPSTREAM_SHA256: dict[str, str] = {
-    "omlx/engine/vlm.py": (
-        "d6a3dc462c73f17d7928904b0ae6a167c6d5f22ff39b3fff4a92b8681e008f0f"
-    ),
-    "omlx/model_settings.py": (
-        "322d6bde1d861d2acad797fba9176f9c68c41f78a6e6aa322dd85e5f05386ceb"
-    ),
-    "omlx/patches/inkling2/model.py": (
-        "aa2031cb7adac6100b77402efaab010b861b36a0edb4775c86a506e4e01281d4"
-    ),
-    "omlx/patches/moe_expert_offload.py": (
-        "8826c11b2bcb6f7532b9be9a95822299c1e4e810e6c73fc0424861b5e3405e37"
-    ),
-    "omlx/patches/moe_offload_compat.py": (
-        "841db0a7747e3b3067396c0cd0da14aa4ed558ce624874c9460b80b7dd9db595"
-    ),
-    "omlx/utils/model_loading.py": (
-        "0b5441a0edae640cf39f37cf187b34c1193a40a30e042fc132cb65f20ece77ad"
-    ),
+    "omlx/engine/vlm.py": "d6a3dc462c73f17d7928904b0ae6a167c6d5f22ff39b3fff4a92b8681e008f0f",
+    "omlx/model_settings.py": "322d6bde1d861d2acad797fba9176f9c68c41f78a6e6aa322dd85e5f05386ceb",
+    "omlx/patches/inkling2/model.py": "aa2031cb7adac6100b77402efaab010b861b36a0edb4775c86a506e4e01281d4",
+    "omlx/patches/moe_expert_offload.py": "8826c11b2bcb6f7532b9be9a95822299c1e4e810e6c73fc0424861b5e3405e37",
+    "omlx/patches/moe_offload_compat.py": "841db0a7747e3b3067396c0cd0da14aa4ed558ce624874c9460b80b7dd9db595",
+    "omlx/prefill_helper/adapters/inkling2.py": "9872f20d807000adfe3374d35e003e93009edeaa062632bd7db2dd6758ca13d9",
+    "omlx/scheduler.py": "fc2d468c26d4587522681c0c7f20723729cdf297db82072b1e3eb54fb0841175",
+    "omlx/utils/model_loading.py": "0b5441a0edae640cf39f37cf187b34c1193a40a30e042fc132cb65f20ece77ad",
 }
 
-# Expected SHA-256 digests of the 6 files after applying patches/omlx-624cff0e.patch.
+# Expected SHA-256 digests after applying the text patch.
 PATCHED_SHA256: dict[str, str] = {
-    "omlx/engine/vlm.py": (
-        "30d9db177e936e45c2aa8d6a0ed6f162903373e5a8c101998765546459757b17"
-    ),
-    "omlx/model_settings.py": (
-        "4fb61d00bd17e69c22df46f2b6ea153122d4f29b2acc1f794b9a01fb03452d83"
-    ),
-    "omlx/patches/inkling2/model.py": (
-        "ddfee0730524a85bd21e3d46e30b0c4c105bebe6c5bbab36160d4e67eebdd137"
-    ),
-    "omlx/patches/moe_expert_offload.py": (
-        "b38b306e004dcd41879354731ee73a879e1a846f9537db19239ec33c1a288eed"
-    ),
-    "omlx/patches/moe_offload_compat.py": (
-        "93a58442ae7979c1ba4c6fc937f760d34b66dd48fa2dfda1e5c48e00b1afd9cb"
-    ),
-    "omlx/utils/model_loading.py": (
-        "b52639d54e7fb027cfbfaddf2c81b8852147fd9f68708824a0dc5a9d071eabd9"
-    ),
+    "omlx/engine/vlm.py": "30d9db177e936e45c2aa8d6a0ed6f162903373e5a8c101998765546459757b17",
+    "omlx/model_settings.py": "4fb61d00bd17e69c22df46f2b6ea153122d4f29b2acc1f794b9a01fb03452d83",
+    "omlx/patches/inkling2/model.py": "07b37245b441037f11c4c20f51d1dbb60cd57fccf969cc498044f9ea741b7243",
+    "omlx/patches/moe_expert_offload.py": "179d0e1ec6a9acebc3eb9d6c418d444b632c60f2ca0f27c6a56e6f48a3212cf1",
+    "omlx/patches/moe_offload_compat.py": "93a58442ae7979c1ba4c6fc937f760d34b66dd48fa2dfda1e5c48e00b1afd9cb",
+    "omlx/prefill_helper/adapters/inkling2.py": "3f3af8a08df2940baf0c9dc8e859e1a13d60d0016314decfb4294b2d6c79990e",
+    "omlx/scheduler.py": "d83252b68fc063effcb8f7ecc55b3922ba8579b6135b8d84ca0a147cd3e8b043",
+    "omlx/utils/model_loading.py": "b52639d54e7fb027cfbfaddf2c81b8852147fd9f68708824a0dc5a9d071eabd9",
 }
 
-# Mapping from source path inside this package to destination path inside oMLX.
-COPIED_FILES: dict[str, str] = {
-    "module/omlx/patches/inkling2/moe_offload.py": (
-        "omlx/patches/inkling2/moe_offload.py"
-    ),
-    "tests/test_inkling2_split_experts.py": "tests/test_inkling2_split_experts.py",
-    "tests/test_inkling2_moe_offload.py": "tests/test_inkling2_moe_offload.py",
-    "tests/test_inkling2_offload_wiring.py": "tests/test_inkling2_offload_wiring.py",
+# Existing fixtures are replaced as bytes and backed up in the install record.
+REPLACED_BASE_SHA256: dict[str, str] = {
+    "tests/fixtures/prefill_contract/inkling2/case.npz": "8ceebbc8870dffba078c60e2d206d8b5f7a8f9e0b9a5cc0d1706b0b939b983cc",
+    "tests/fixtures/prefill_contract/inkling2/meta.json": "6dde376a87049afb0c36d7869ade959e6193291f8ed82817b6c76d1fb1b0f8af",
 }
+
+REPLACED_SHA256: dict[str, str] = {
+    "tests/fixtures/prefill_contract/inkling2/case.npz": "ad53799dbd1b99a19daebe884c146b850286c4f439e3009834caaae8fba0df1e",
+    "tests/fixtures/prefill_contract/inkling2/meta.json": "b22dc93317d5eeea462cc44d07fad13919dee42d1eaac64bcc560df1f1a995ea",
+}
+
+# Package source path -> new path in the target oMLX tree.
+COPIED_FILES: dict[str, str] = {
+    "module/omlx/patches/inkling2/moe_offload.py": "omlx/patches/inkling2/moe_offload.py",
+    "tests/test_inkling2_decode_overlap.py": "tests/test_inkling2_decode_overlap.py",
+    "tests/test_inkling2_helper_cache.py": "tests/test_inkling2_helper_cache.py",
+    "tests/test_inkling2_moe_offload.py": "tests/test_inkling2_moe_offload.py",
+    "tests/test_inkling2_offload_io.py": "tests/test_inkling2_offload_io.py",
+    "tests/test_inkling2_offload_timing.py": "tests/test_inkling2_offload_timing.py",
+    "tests/test_inkling2_offload_wiring.py": "tests/test_inkling2_offload_wiring.py",
+    "tests/test_inkling2_prefill_cache_scope.py": "tests/test_inkling2_prefill_cache_scope.py",
+    "tests/test_inkling2_prefill_no_evict.py": "tests/test_inkling2_prefill_no_evict.py",
+    "tests/test_inkling2_split_experts.py": "tests/test_inkling2_split_experts.py",
+    "tests/test_inkling2_window_cache.py": "tests/test_inkling2_window_cache.py",
+    "tests/test_moe_io_workers_env.py": "tests/test_moe_io_workers_env.py",
+    "tests/test_scheduler_prefill_step_size.py": "tests/test_scheduler_prefill_step_size.py",
+    "tests/test_scheduler_rotating_arrays_block.py": "tests/test_scheduler_rotating_arrays_block.py",
+}
+
+# All pre-existing target files participate in strict preflight and restoration.
+BASE_SHA256 = {**UPSTREAM_SHA256, **REPLACED_BASE_SHA256}
+INSTALLED_SHA256 = {**PATCHED_SHA256, **REPLACED_SHA256}
 
 _HUNK_HEADER_RE = re.compile(rb"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$")
 
@@ -280,14 +283,16 @@ def _validate_omlx_root(target_root: Path) -> None:
         raise InstallError(f"Target {target_root} does not contain an omlx/ directory.")
 
 
-def _load_package_assets(pkg_root: Path) -> tuple[list[FilePatch], dict[str, bytes]]:
+def _load_package_assets(
+    pkg_root: Path,
+) -> tuple[list[FilePatch], dict[str, bytes], dict[str, bytes]]:
     patch_path = pkg_root / PATCH_REL_PATH
     if not patch_path.is_file():
         raise InstallError(f"Missing package patch file: {patch_path}")
     file_patches = _parse_unified_diff(patch_path.read_bytes())
     patch_targets = {fp.rel_path for fp in file_patches}
     expected_targets = set(UPSTREAM_SHA256)
-    if patch_targets != expected_targets:
+    if patch_targets != expected_targets or len(file_patches) != len(patch_targets):
         raise InstallError(
             "Patch file target list does not match expected upstream files: "
             f"{sorted(patch_targets)}"
@@ -300,7 +305,17 @@ def _load_package_assets(pkg_root: Path) -> tuple[list[FilePatch], dict[str, byt
             raise InstallError(f"Missing package source file: {src_path}")
         copied_data[dst_rel] = src_path.read_bytes()
 
-    return file_patches, copied_data
+    replaced_data: dict[str, bytes] = {}
+    for rel, expected_sha in REPLACED_SHA256.items():
+        path = pkg_root / rel
+        if not path.is_file():
+            raise InstallError(f"Missing package replacement file: {path}")
+        data = path.read_bytes()
+        if _sha256_bytes(data) != expected_sha:
+            raise InstallError(f"Package replacement SHA-256 mismatch: {rel}")
+        replaced_data[rel] = data
+
+    return file_patches, copied_data, replaced_data
 
 
 def _load_record(record_path: Path) -> dict:
@@ -316,12 +331,12 @@ def _load_record(record_path: Path) -> dict:
 def _check_status(pkg_root: Path, target_root: Path) -> tuple[str, list[str]]:
     """Inspect ``target_root`` without modifying it; return (status, details)."""
     _validate_omlx_root(target_root)
-    _, copied_data = _load_package_assets(pkg_root)
+    _, copied_data, _ = _load_package_assets(pkg_root)
     record_path = target_root / RECORD_FILENAME
 
     if not record_path.exists():
         mismatches: list[str] = []
-        for rel, expected_sha in UPSTREAM_SHA256.items():
+        for rel, expected_sha in BASE_SHA256.items():
             path = target_root / rel
             if not path.is_file():
                 mismatches.append(f"missing upstream file: {rel}")
@@ -345,18 +360,21 @@ def _check_status(pkg_root: Path, target_root: Path) -> tuple[str, list[str]]:
         return "modified", mismatches
 
     record = _load_record(record_path)
-    patched_rec = record.get("patched_files", {})
+    patched_rec = {
+        **record.get("patched_files", {}),
+        **record.get("replaced_files", {}),
+    }
     copied_rec = record.get("copied_files", {})
     diffs: list[str] = []
 
-    for rel in UPSTREAM_SHA256:
+    for rel in BASE_SHA256:
         path = target_root / rel
         expected_after = patched_rec.get(rel, {}).get("after_sha256")
         if not path.is_file():
             diffs.append(f"missing patched file: {rel}")
             continue
         actual = _sha256_file(path)
-        if actual != expected_after or actual != PATCHED_SHA256[rel]:
+        if actual != expected_after or actual != INSTALLED_SHA256[rel]:
             diffs.append(
                 f"modified after install: {rel} "
                 f"(recorded {str(expected_after)[:12]}, got {actual[:12]})"
@@ -378,7 +396,8 @@ def _check_status(pkg_root: Path, target_root: Path) -> tuple[str, list[str]]:
 
     if not diffs:
         return "installed", [
-            f"All 6 patched files and 4 added files match install record "
+            f"All {len(UPSTREAM_SHA256)} patched, {len(REPLACED_SHA256)} replaced, "
+            f"and {len(COPIED_FILES)} added files match install record "
             f"({RECORD_FILENAME})."
         ]
     return "modified", diffs
@@ -389,12 +408,12 @@ def _cmd_check(pkg_root: Path, target_root: Path) -> int:
     print(f"Status: {status}")
     for line in details:
         print(f"  - {line}")
-    return 0
+    return 1 if status == "modified" else 0
 
 
 def _cmd_install(pkg_root: Path, target_root: Path) -> int:
     _validate_omlx_root(target_root)
-    file_patches, copied_data = _load_package_assets(pkg_root)
+    file_patches, copied_data, replaced_data = _load_package_assets(pkg_root)
     record_path = target_root / RECORD_FILENAME
 
     if record_path.exists():
@@ -415,7 +434,7 @@ def _cmd_install(pkg_root: Path, target_root: Path) -> int:
 
     originals: dict[str, bytes] = {}
     mismatches: list[str] = []
-    for rel, expected_sha in UPSTREAM_SHA256.items():
+    for rel, expected_sha in BASE_SHA256.items():
         target_file = target_root / rel
         if not target_file.is_file():
             mismatches.append(f"{rel} (missing)")
@@ -449,15 +468,21 @@ def _cmd_install(pkg_root: Path, target_root: Path) -> int:
             )
         patched_contents[fp.rel_path] = patched
 
-    # All verification and dry-run checks passed; commit changes atomically.
+    # All verification passed. Save originals for both text and binary files.
+    # Each write uses a same-directory atomic replacement.
     patched_record: dict[str, dict[str, str]] = {}
+    replaced_record: dict[str, dict[str, str]] = {}
     originals_b64: dict[str, str] = {}
-    for rel, patched in patched_contents.items():
+    for rel, patched in {**patched_contents, **replaced_data}.items():
         _atomic_write(target_root / rel, patched)
-        patched_record[rel] = {
-            "before_sha256": UPSTREAM_SHA256[rel],
-            "after_sha256": PATCHED_SHA256[rel],
+        entry = {
+            "before_sha256": BASE_SHA256[rel],
+            "after_sha256": INSTALLED_SHA256[rel],
         }
+        if rel in REPLACED_SHA256:
+            replaced_record[rel] = entry
+        else:
+            patched_record[rel] = entry
         compressed = zlib.compress(originals[rel], level=9)
         originals_b64[rel] = base64.b64encode(compressed).decode("ascii")
 
@@ -472,6 +497,7 @@ def _cmd_install(pkg_root: Path, target_root: Path) -> int:
         "upstream_commit": UPSTREAM_COMMIT,
         "installed_at": datetime.now(timezone.utc).isoformat(),
         "patched_files": patched_record,
+        "replaced_files": replaced_record,
         "copied_files": copied_record,
         "originals_zlib_b64": originals_b64,
     }
@@ -482,16 +508,17 @@ def _cmd_install(pkg_root: Path, target_root: Path) -> int:
 
     print(
         f"Installed {PACKAGE_NAME} {PACKAGE_VERSION} into {target_root} "
-        f"(6 patched, 4 added)."
+        f"({len(patched_record)} patched, {len(replaced_record)} replaced, "
+        f"{len(copied_record)} added)."
     )
     print(f"Install record written to {record_path}")
     print("\nNext steps — run tests inside the target tree:")
     print(f"  cd {target_root}")
     print(
         "  PYTHONPATH=. pytest "
-        "tests/test_inkling2_split_experts.py "
-        "tests/test_inkling2_moe_offload.py "
-        "tests/test_inkling2_offload_wiring.py"
+        "-q -p no:cacheprovider tests/test_inkling2_*.py "
+        "tests/test_moe_io_workers_env.py tests/test_scheduler*.py "
+        "tests/test_paged*.py tests/test_prefix*.py tests/test_prefill_helper*.py"
     )
     print(
         "  PYTHONPATH=. pytest "
@@ -504,6 +531,22 @@ def _cmd_install(pkg_root: Path, target_root: Path) -> int:
         "tests/test_inkling_vlm_mtp.py"
     )
     return 0
+
+
+def _restore_backup(rel: str, record: dict) -> bytes:
+    """Decode a saved original and verify it against the supported base tree."""
+    encoded = record.get("originals_zlib_b64", {}).get(rel)
+    if not isinstance(encoded, str):
+        raise InstallError(f"Cannot restore {rel}: no backup data in install record.")
+    try:
+        restored = zlib.decompress(base64.b64decode(encoded, validate=True))
+    except (ValueError, zlib.error) as exc:
+        raise InstallError(
+            f"Invalid backup data for {rel}; refusing to overwrite."
+        ) from exc
+    if _sha256_bytes(restored) != BASE_SHA256[rel]:
+        raise InstallError(f"Backup SHA-256 mismatch for {rel}; refusing to overwrite.")
+    return restored
 
 
 def _restore_bytes_for_file(
@@ -529,22 +572,12 @@ def _restore_bytes_for_file(
             f"Reverse patch did not restore original SHA-256 for {fp.rel_path}."
         )
 
-    encoded = record.get("originals_zlib_b64", {}).get(fp.rel_path)
-    if not isinstance(encoded, str):
-        raise InstallError(
-            f"Cannot --force restore {fp.rel_path}: no backup data in install record."
-        )
-    restored = zlib.decompress(base64.b64decode(encoded.encode("ascii")))
-    if _sha256_bytes(restored) != expected_orig:
-        raise InstallError(
-            f"Backup SHA-256 mismatch for {fp.rel_path}; refusing to overwrite."
-        )
-    return restored
+    return _restore_backup(fp.rel_path, record)
 
 
 def _cmd_uninstall(pkg_root: Path, target_root: Path, *, force: bool) -> int:
     _validate_omlx_root(target_root)
-    file_patches, _ = _load_package_assets(pkg_root)
+    file_patches, copied_data, _ = _load_package_assets(pkg_root)
     record_path = target_root / RECORD_FILENAME
 
     if not record_path.is_file():
@@ -554,12 +587,15 @@ def _cmd_uninstall(pkg_root: Path, target_root: Path, *, force: bool) -> int:
         )
 
     record = _load_record(record_path)
-    patched_rec = record.get("patched_files", {})
+    patched_rec = {
+        **record.get("patched_files", {}),
+        **record.get("replaced_files", {}),
+    }
     copied_rec = record.get("copied_files", {})
 
     modified: list[str] = []
     current_patched: dict[str, bytes | None] = {}
-    for rel in UPSTREAM_SHA256:
+    for rel in BASE_SHA256:
         path = target_root / rel
         expected_after = patched_rec.get(rel, {}).get("after_sha256")
         if not path.is_file():
@@ -569,7 +605,7 @@ def _cmd_uninstall(pkg_root: Path, target_root: Path, *, force: bool) -> int:
         raw = path.read_bytes()
         current_patched[rel] = raw
         actual = _sha256_bytes(raw)
-        if actual != expected_after:
+        if actual != expected_after or actual != INSTALLED_SHA256[rel]:
             modified.append(
                 f"{rel} (recorded {str(expected_after)[:12]}, got {actual[:12]})"
             )
@@ -581,7 +617,7 @@ def _cmd_uninstall(pkg_root: Path, target_root: Path, *, force: bool) -> int:
             modified.append(f"{dst_rel} (missing)")
             continue
         actual = _sha256_file(path)
-        if actual != expected_copy:
+        if actual != expected_copy or actual != _sha256_bytes(copied_data[dst_rel]):
             modified.append(
                 f"{dst_rel} (recorded {str(expected_copy)[:12]}, got {actual[:12]})"
             )
@@ -606,11 +642,14 @@ def _cmd_uninstall(pkg_root: Path, target_root: Path, *, force: bool) -> int:
         restored_contents[fp.rel_path] = _restore_bytes_for_file(
             fp, current_patched[fp.rel_path], record, force=force
         )
+    # Verify every replacement backup before restoring any file.
+    for rel in REPLACED_SHA256:
+        restored_contents[rel] = _restore_backup(rel, record)
 
     for rel, original_bytes in restored_contents.items():
         dest = target_root / rel
         _atomic_write(dest, original_bytes)
-        if _sha256_file(dest) != UPSTREAM_SHA256[rel]:
+        if _sha256_file(dest) != BASE_SHA256[rel]:
             raise InstallError(f"Post-write SHA-256 verification failed for {rel}.")
 
     for dst_rel in COPIED_FILES.values():
@@ -619,7 +658,8 @@ def _cmd_uninstall(pkg_root: Path, target_root: Path, *, force: bool) -> int:
 
     print(
         f"Uninstalled {PACKAGE_NAME} from {target_root} "
-        "(restored 6 files byte-identically, removed 4 files and install record)."
+        f"(restored {len(BASE_SHA256)} files byte-identically, "
+        f"removed {len(COPIED_FILES)} files and install record)."
     )
     return 0
 
@@ -639,7 +679,7 @@ def _build_parser() -> argparse.ArgumentParser:
     mode.add_argument(
         "--check",
         action="store_true",
-        help="Report status (not installed / installed / modified) without changes.",
+        help="Report status without changes; exit 1 for modified or invalid trees.",
     )
     mode.add_argument(
         "--uninstall",

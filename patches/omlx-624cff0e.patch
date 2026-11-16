@@ -48,9 +48,18 @@ index 08fbd73..0298074 100644
  
  def ane_prefill_backend(model_type: str | None) -> str | None:
 diff --git a/omlx/patches/inkling2/model.py b/omlx/patches/inkling2/model.py
-index 8496f68..8392333 100644
+index 8496f68..0fba07d 100644
 --- a/omlx/patches/inkling2/model.py
 +++ b/omlx/patches/inkling2/model.py
+@@ -21,7 +21,7 @@ from typing import Any
+ import mlx.core as mx
+ import mlx.nn as nn
+ from mlx_lm.models.base import BaseModelArgs
+-from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
++from mlx_lm.models.cache import ArraysCache, CacheList, KVCache, RotatingKVCache
+ 
+ from . import kernels
+ from .loader import sanitize_weights
 @@ -245,27 +245,39 @@ class Inkling2Experts(nn.Module):
          self._gcap = mx.array(args.mlp_gate_softcap, dtype=mx.float32)
          self._ucap = mx.array(args.mlp_up_softcap, dtype=mx.float32)
@@ -127,7 +136,33 @@ index 8496f68..8392333 100644
  
  
  class AttnResQuery(nn.Module):
-@@ -529,6 +558,21 @@ class Inkling2Layer(nn.Module):
+@@ -466,6 +495,25 @@ class Inkling2Attention(nn.Module):
+     def attend(self, q, k, v, rel, sink, kv):
+         if kv is not None:
+             k, v = kv.update_and_fetch(k, v)
++            # Single-token decode wraps inside RotatingKVCache /
++            # BatchRotatingKVCache; restore temporal order without mutating the
++            # ring buffer before banded_sink_attention and left_padding slicing.
++            if getattr(kv, "max_size", 0) and getattr(kv, "rotated", True):
++                idx = getattr(kv, "_idx", k.shape[2])
++                if 0 < idx < k.shape[2]:
++                    keep = getattr(kv, "keep", 0)
++                    if keep:
++                        k = mx.concatenate(
++                            [k[..., :keep, :], k[..., idx:, :], k[..., keep:idx, :]],
++                            axis=2,
++                        )
++                        v = mx.concatenate(
++                            [v[..., :keep, :], v[..., idx:, :], v[..., keep:idx, :]],
++                            axis=2,
++                        )
++                    else:
++                        k = mx.concatenate([k[..., idx:, :], k[..., :idx, :]], axis=2)
++                        v = mx.concatenate([v[..., idx:, :], v[..., :idx, :]], axis=2)
+         left_padding = getattr(kv, "left_padding", None) if kv is not None else None
+         return kernels.banded_sink_attention(
+             q,
+@@ -529,6 +577,21 @@ class Inkling2Layer(nn.Module):
          layer = weakref.proxy(self)
          self._pre_compiled = mx.compile(lambda *a: Inkling2Layer._pre(layer, *a))
          self._post_compiled = mx.compile(lambda *a: Inkling2Layer._post(layer, *a))
@@ -149,7 +184,7 @@ index 8496f68..8392333 100644
  
      def _pre(self, h, blocks, ks, vs, tau=None):
          dtype = h.dtype
-@@ -550,7 +594,7 @@ class Inkling2Layer(nn.Module):
+@@ -550,7 +613,7 @@ class Inkling2Layer(nn.Module):
              xv = self.v_input_norm(xv).astype(dtype)
          return (*self.attn.project(xq, xk, xv, ks, vs, tau), h_n)
  
@@ -158,7 +193,7 @@ index 8496f68..8392333 100644
          a = self.attn.output(out, gate)
          a, s2 = _static_conv(a, self.attn_conv, s2, self._conv_scale)
          if self.is_boundary:
-@@ -558,9 +602,20 @@ class Inkling2Layer(nn.Module):
+@@ -558,9 +621,20 @@ class Inkling2Layer(nn.Module):
          else:
              residual = h.astype(mx.float32) + a.astype(mx.float32)
          y = self.mlp_input(mlp_blocks, _unit_rms(residual))[:, :, 0]
@@ -181,7 +216,7 @@ index 8496f68..8392333 100644
  
      def __call__(self, h, blocks, cache=None):
          """``h``: partial block sum [B, L, H] bf16. ``blocks``: list of unit-RMS
-@@ -578,7 +633,6 @@ class Inkling2Layer(nn.Module):
+@@ -578,20 +652,46 @@ class Inkling2Layer(nn.Module):
          tau = self.attn.log_tau(kv, length)
          compiled = length <= _COMPILED_MAX_TOKENS
          pre = self._pre_compiled if compiled else self._pre
@@ -189,7 +224,19 @@ index 8496f68..8392333 100644
          pre_args = (h, blocks, states[0], states[1])
          if tau is not None:
              pre_args = (*pre_args, tau)
-@@ -586,7 +640,19 @@ class Inkling2Layer(nn.Module):
+         q, k, v, rel, gate, sink, ks, vs, h_n = pre(*pre_args)
++        verify_kv = None
++        if (
++            1 < length <= _COMPILED_MAX_TOKENS
++            and kv is not None
++            and conv is not None
++            and hasattr(kv, "max_size")
++            and not hasattr(kv, "rotated")
++        ):
++            # Un-armed verify calls (outside batch_generator) cannot roll back
++            # RotatingKVCache past max_size via stock trim; retain pre-update
++            # refs (rebound, not mutated, on L > 1 concat).
++            verify_kv = ((kv.keys, kv.values, kv.offset, kv._idx), k, v)
          out = self.attn.attend(q, k, v, rel, sink, kv)
          if self.is_boundary:
              blocks.append(h_n)
@@ -210,8 +257,73 @@ index 8496f68..8392333 100644
          if conv is not None:
              windows = (ks, vs, s2, s3)
              if 1 < length <= _COMPILED_MAX_TOKENS:
+                 # Speculative verify rollback re-cuts the states from these.
+                 conv._omlx_verify_xp = dict(enumerate(windows))
++                conv._omlx_verify_kv = verify_kv
++            else:
++                conv._omlx_verify_kv = None
+             keep = self._conv_k - 1
+             for slot, window in enumerate(windows):
+                 # A small copy, so the state does not pin the chunk's window.
+@@ -757,17 +857,39 @@ class Model(nn.Module):
+         """Drop the rejected drafts of a ``num_drafts + 1``-token verify."""
+         rejected = int(num_drafts) - int(accepted)
+         if rejected <= 0:
++            for entry in cache:
++                if len(entry) > 1 and entry[1] is not None:
++                    entry[1]._omlx_verify_kv = None
+             return True
+         keep = int(accepted) + 1
+         width = self.args.text.sconv_kernel_size - 1
+         for entry in cache:
+             kv, conv = entry[0], entry[1]
+             windows = getattr(conv, "_omlx_verify_xp", None)
+-            if windows is None or kv.trim(rejected) != rejected:
++            verify_kv = getattr(conv, "_omlx_verify_kv", None)
++            if windows is None:
++                return False
++            if (
++                getattr(kv, "_mtp_undo", None) is not None
++                or not hasattr(kv, "max_size")
++                or kv.offset < kv.max_size
++            ):
++                trimmed = kv.trim(rejected)
++            elif verify_kv is not None:
++                snap, new_k, new_v = verify_kv
++                kv.keys, kv.values, kv.offset, kv._idx = snap
++                if keep > 0:
++                    kv.update_and_fetch(new_k[..., :keep, :], new_v[..., :keep, :])
++                kv._mtp_undo = None
++                trimmed = rejected
++            else:
++                trimmed = 0
++            if trimmed != rejected:
+                 return False
+             for slot, window in windows.items():
+                 conv[slot] = window[:, keep : keep + width] * 1.0
+             conv._omlx_verify_xp = None
++            conv._omlx_verify_kv = None
+         return True
+ 
+     def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
+@@ -781,7 +903,14 @@ class Model(nn.Module):
+         return self.model.layers
+ 
+     def make_cache(self):
+-        return [CacheList(KVCache(), ArraysCache(4)) for _ in self.model.layers]
++        window = self.args.text.sliding_window_size
++        return [
++            CacheList(
++                RotatingKVCache(max_size=window) if layer.sliding else KVCache(),
++                ArraysCache(4),
++            )
++            for layer in self.model.layers
++        ]
+ 
+     def sanitize(self, weights: dict) -> dict:
+         out, formats = sanitize_weights(self, weights)
 diff --git a/omlx/patches/moe_expert_offload.py b/omlx/patches/moe_expert_offload.py
-index 1fe5fa5..cc0b25a 100644
+index 1fe5fa5..f0f0207 100644
 --- a/omlx/patches/moe_expert_offload.py
 +++ b/omlx/patches/moe_expert_offload.py
 @@ -78,6 +78,7 @@ _DTYPES = {
@@ -222,7 +334,27 @@ index 1fe5fa5..cc0b25a 100644
  }
  
  
-@@ -1079,8 +1080,8 @@ def apply_moe_expert_offload(
+@@ -251,7 +252,18 @@ class _GLUStoreView:
+ # count. ``_IO_WORKERS`` <= 1 keeps the serial path and creates no threads.
+ # At most 4 x workers experts' payloads are in flight, which is what bounds
+ # the extra host memory the pipeline holds.
+-_IO_WORKERS = 12
++def _env_io_workers(default: int = 12) -> int:
++    """Reader threads; OMLX_MOE_IO_WORKERS overrides (invalid values keep the default)."""
++    value = os.environ.get("OMLX_MOE_IO_WORKERS")
++    if value is None:
++        return default
++    try:
++        return max(0, int(value))
++    except ValueError:
++        return default
++
++
++_IO_WORKERS = _env_io_workers()
+ _IO_LOCK = threading.Lock()
+ _IO_POOL: ThreadPoolExecutor | None = None
+ _IO_BATCH = 0
+@@ -1079,8 +1091,8 @@ def apply_moe_expert_offload(
      # GLM DSA blocks have their own adapter (fused gate/up, native weighted
      # sum); it shares this store format and the same wrap-before-materialize
      # contract, so the engine sees one count. DeepSeek V4 / glm5_next blocks
@@ -233,7 +365,7 @@ index 1fe5fa5..cc0b25a 100644
      from .glm_moe_dsa.moe_offload import apply_glm_moe_expert_offload
  
      wrapped = apply_glm_moe_expert_offload(model, model_dir, resident_fraction)
-@@ -1089,6 +1090,9 @@ def apply_moe_expert_offload(
+@@ -1089,6 +1101,9 @@ def apply_moe_expert_offload(
      wrapped += apply_deepseek_v4_moe_expert_offload(
          model, model_dir, resident_fraction, mtp_resident=mtp_resident
      )
@@ -243,7 +375,7 @@ index 1fe5fa5..cc0b25a 100644
      total_bytes = resident_bytes = 0
      staging_sizes = {}
      staging_requested = (
-@@ -1201,6 +1205,11 @@ def estimate_offload_admission_bytes(
+@@ -1201,6 +1216,11 @@ def estimate_offload_admission_bytes(
              if kind == "deepseek_v41":
                  # V4.1 admission is owned by its own adapter's estimator.
                  return full_size
@@ -280,6 +412,152 @@ index a0469b8..c3cb821 100644
  
      from .moe_expert_offload import CheckpointExpertStore, _qwen35_checkpoint_prefix
  
+diff --git a/omlx/prefill_helper/adapters/inkling2.py b/omlx/prefill_helper/adapters/inkling2.py
+index 621e17f..7e076cd 100644
+--- a/omlx/prefill_helper/adapters/inkling2.py
++++ b/omlx/prefill_helper/adapters/inkling2.py
+@@ -86,10 +86,35 @@ def _run_layers(
+ 
+ def _cache_state(i: int, item: Any, since: int) -> Arrays:
+     kv, conv = item[0], item[1]
+-    out = {
+-        f"{i}.k": kv.keys[..., since : kv.offset, :],
+-        f"{i}.v": kv.values[..., since : kv.offset, :],
+-    }
++    out = {}
++    if hasattr(kv, "max_size"):
++        new_len = max(0, int(kv.offset) - int(since))
++        if new_len == 0 or kv.keys is None:
++            k_slice = kv.keys[..., :0, :] if kv.keys is not None else None
++            v_slice = kv.values[..., :0, :] if kv.values is not None else None
++        elif since == 0:
++            # A prefix snapshot carries the ring in storage order. Its logical
++            # position can exceed retained rows, and _idx must match that layout.
++            k_slice, v_slice = kv.keys_and_values()
++            out[f"{i}.rotating"] = mx.array(
++                [kv.keep, kv.max_size, kv.offset, kv._idx], dtype=mx.int64
++            )
++        else:
++            keys, values = kv.keys_and_values()
++            idx = getattr(kv, "_idx", keys.shape[2])
++            if 0 < idx < keys.shape[2] and hasattr(kv, "_temporal_order"):
++                keys = kv._temporal_order(keys)
++                values = kv._temporal_order(values)
++            take = min(new_len, keys.shape[2])
++            k_slice = keys[..., keys.shape[2] - take :, :]
++            v_slice = values[..., values.shape[2] - take :, :]
++    else:
++        k_slice = kv.keys[..., since : kv.offset, :]
++        v_slice = kv.values[..., since : kv.offset, :]
++    out.update({
++        f"{i}.k": k_slice,
++        f"{i}.v": v_slice,
++    })
+     for slot in range(_CONV_SLOTS):
+         if conv[slot] is not None:
+             out[f"{i}.c{slot}"] = conv[slot]
+@@ -98,7 +123,7 @@ def _cache_state(i: int, item: Any, since: int) -> Arrays:
+ 
+ class Inkling2Adapter(StageAdapter):
+     model_types = ("inkling2",)
+-    contract = 1
++    contract = 2
+     captures_layers = True
+ 
+     def serves(self, engine_type: str | None, model_path: str | Path | None) -> bool:
+@@ -219,7 +244,11 @@ class Inkling2Adapter(StageAdapter):
+         for i in range(k):
+             kv, conv = cache[i][0], cache[i][1]
+             keys = state[f"{i}.k"]
+-            if keys.shape[2]:
++            rotating = state.get(f"{i}.rotating")
++            if rotating is not None:
++                kv.keys, kv.values = keys, state[f"{i}.v"]
++                kv.keep, kv.max_size, kv.offset, kv._idx = rotating.tolist()
++            elif keys.shape[2]:
+                 kv.update_and_fetch(keys, state[f"{i}.v"])
+             for slot in range(_CONV_SLOTS):
+                 value = state.get(f"{i}.c{slot}")
+diff --git a/omlx/scheduler.py b/omlx/scheduler.py
+index d567696..50dc0f3 100644
+--- a/omlx/scheduler.py
++++ b/omlx/scheduler.py
+@@ -16,6 +16,7 @@ import copy
+ import gc
+ import importlib
+ import inspect
++import os
+ import logging
+ import threading
+ import time
+@@ -1938,6 +1939,26 @@ def _mimo_fused_full_attention() -> bool:
+         return False
+ 
+ 
++# Default prefill chunk; OMLX_PREFILL_STEP_SIZE overrides it at startup. Expert
++# offload streams the non-resident experts once per chunk; larger chunks amortize it.
++def _default_prefill_step_size() -> int:
++    value = os.environ.get("OMLX_PREFILL_STEP_SIZE", "2048")
++    try:
++        size = int(value)
++        if size > 0:
++            return size
++    except ValueError:
++        pass
++    logger.warning(
++        "OMLX_PREFILL_STEP_SIZE must be a positive integer; got %r. Using 2048.",
++        value,
++    )
++    return 2048
++
++
++_DEFAULT_PREFILL_STEP_SIZE = _default_prefill_step_size()
++
++
+ @dataclass
+ class SchedulerConfig:
+     """Configuration for the scheduler."""
+@@ -1952,7 +1973,7 @@ class SchedulerConfig:
+     completion_batch_size: int = 32
+     # Per-forward embedding input chunk size
+     embedding_batch_size: int = 32
+-    prefill_step_size: int = 2048
++    prefill_step_size: int = _DEFAULT_PREFILL_STEP_SIZE
+     # When True, long prefills are processed one chunk per step() call,
+     # interleaved with decode steps for already-running requests. This
+     # reduces TTFT for concurrent requests but adds per-step overhead.
+@@ -2009,6 +2030,15 @@ class SchedulerConfig:
+     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
+     mlx_cache_cleanup_interval: int = 512  # Steps between mx.clear_cache() calls
+ 
++    def __post_init__(self) -> None:
++        # Chunk planning advances by this value; accepting zero would loop forever.
++        if (
++            not isinstance(self.prefill_step_size, int)
++            or isinstance(self.prefill_step_size, bool)
++            or self.prefill_step_size <= 0
++        ):
++            raise ValueError("prefill_step_size must be a positive integer")
++
+ 
+ @dataclass
+ class SchedulerOutput:
+@@ -3366,6 +3396,15 @@ class Scheduler:
+                 if target_block_size < window_size:
+                     target_block_size = window_size
+ 
++        # Rotating-window + ArraysCache hybrids (Inkling 2: sliding-window KV plus
++        # dynamic-conv state) take a boundary snapshot at every block and clamp
++        # each prefill chunk to it. _enlarge_block_size_for_arrays_cache skips
++        # models with a rotating window, so without this the chunk stays at the
++        # window (1024) whatever prefill_step_size is. Keep a window multiple.
++        step = int(self.config.prefill_step_size or 0)
++        if step > target_block_size and self._model_has_arrays_cache():
++            target_block_size = -(-step // window_size) * window_size
++
+         if self.config.paged_cache_block_size != target_block_size:
+             logger.info(
+                 "Aligning paged cache block_size=%s to %s "
 diff --git a/omlx/utils/model_loading.py b/omlx/utils/model_loading.py
 index f690279..d89af58 100644
 --- a/omlx/utils/model_loading.py

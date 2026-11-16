@@ -30,7 +30,10 @@ import json
 import logging
 import os
 import struct
-from concurrent.futures import wait
+import threading
+import time
+from concurrent.futures import FIRST_COMPLETED, wait
+from contextlib import contextmanager
 from pathlib import Path
 
 import mlx.core as mx
@@ -38,6 +41,7 @@ import mlx.nn as nn
 import numpy as np
 
 from ...scheduler import _sync_and_clear_cache
+from ...utils.hardware import get_max_working_set_bytes
 from ..moe_expert_offload import (
     _DTYPES,
     CheckpointExpertStore,
@@ -72,6 +76,146 @@ _MX_DTYPES = {
 
 # Bound large expert reads in addition to the shared pool's expert-count limit.
 INFLIGHT_BYTES = 512 * 1024 * 1024
+
+# Over-capacity prefill frees one group of temporary expert stacks per step, in sizes
+# that vary with each group's expert count. oMLX pins MLX's cache limit at total
+# memory, so without a bound those buffers pile up in the allocator pool (measured
+# +23.6 GB per 1024-token chunk on Inkling-2-Small at residency 0.55). The scheduler
+# reads that growth as per-token prefill cost and its adaptive throttle then cuts
+# chunks to ~1K tokens whatever prefill_step_size says. Bound the pool while the
+# expert-major path runs (same pattern as deepseek_v41's prefill cache scope).
+# OMLX_INKLING2_PREFILL_CACHE_CAP_GB=0 disables the bound.
+PREFILL_CACHE_CAP = int(
+    float(os.environ.get("OMLX_INKLING2_PREFILL_CACHE_CAP_GB", "4")) * (1 << 30)
+)
+_PREFILL_CACHE_SHARE = 16
+
+# The cache limit is process-global; scopes may nest or overlap across engine
+# threads, so only the outermost scope sets it and the last one out restores it.
+_cache_scope_lock = threading.Lock()
+_cache_scope_depth = 0
+_cache_scope_saved = None
+
+
+# Measurement only: OMLX_INKLING2_TIMING=1 accumulates wall time per offload stage
+# and logs one INFO line at most every TIMING_INTERVAL_S seconds (then resets).
+TIMING = os.environ.get("OMLX_INKLING2_TIMING", "0") == "1"
+TIMING_INTERVAL_S = 30.0
+_T: dict = {}
+_t_last = [time.perf_counter()]
+
+# Split only unsorted decode gathers. At 64 routes Inkling2Experts.routes sorts
+# the inputs, and splitting can change the gather_qmm kernel and its rounding.
+DECODE_OVERLAP = os.environ.get("OMLX_INKLING2_DECODE_OVERLAP", "1") != "0"
+_DECODE_OVERLAP_MAX_ROUTES = 64
+
+
+def _tadd(key: str, start: float) -> None:
+    _T[key] = _T.get(key, 0.0) + (time.perf_counter() - start)
+
+
+def _tcount(key: str, n: float = 1) -> None:
+    _T[key] = _T.get(key, 0) + n
+
+
+def _tflush() -> None:
+    now = time.perf_counter()
+    wall = now - _t_last[0]
+    if wall < TIMING_INTERVAL_S:
+        return
+    _t_last[0] = now
+    t = dict(_T)
+    _T.clear()
+    em = t.get("em_wall", 0.0)
+    gb = t.get("em_bytes", 0) / 1e9
+    logger.info(
+        "Inkling2 offload timing: wall=%.1fs em_wall=%.1fs (calls=%d groups=%d "
+        "read_wait=%.1fs convert=%.1fs res_eval=%.1fs grp_eval=%.1fs plan=%.1fs "
+        "read=%.1fGB %.1fGB/s) dec_wall=%.1fs (calls=%d sync=%.1fs ensure=%.1fs "
+        "misses=%d overlap_calls=%d res_eval=%.3fs read_wait=%.3fs "
+        "miss_eval=%.3fs install=%.3fs) ",
+        wall, em, t.get("em_calls", 0), t.get("em_groups", 0),
+        t.get("em_read_wait", 0.0), t.get("em_convert", 0.0),
+        t.get("em_res_eval", 0.0), t.get("em_grp_eval", 0.0), t.get("em_plan", 0.0),
+        gb, gb / em if em else 0.0,
+        t.get("dec_wall", 0.0), t.get("dec_calls", 0), t.get("dec_sync", 0.0),
+        t.get("dec_ensure", 0.0), t.get("dec_misses", 0),
+        t.get("dec_overlap_calls", 0), t.get("dec_overlap_res_eval", 0.0),
+        t.get("dec_overlap_read_wait", 0.0), t.get("dec_overlap_miss_eval", 0.0),
+        t.get("dec_overlap_install", 0.0),
+    )
+
+
+def _prefill_cache_limit() -> int:
+    return min(PREFILL_CACHE_CAP, get_max_working_set_bytes() // _PREFILL_CACHE_SHARE)
+
+
+@contextmanager
+def _prefill_cache_scope():
+    """Bound MLX's allocator pool for one over-capacity expert-major MoE call."""
+    global _cache_scope_depth, _cache_scope_saved
+    if PREFILL_CACHE_CAP <= 0:
+        yield
+        return
+    with _cache_scope_lock:
+        if _cache_scope_depth == 0:
+            _cache_scope_saved = mx.set_cache_limit(_prefill_cache_limit())
+        _cache_scope_depth += 1
+    try:
+        yield
+    finally:
+        with _cache_scope_lock:
+            _cache_scope_depth -= 1
+            if _cache_scope_depth == 0:
+                mx.set_cache_limit(_cache_scope_saved)
+                _cache_scope_saved = None
+
+# Over-capacity prefill (a prompt chunk touching more experts than the cache holds)
+# computes non-resident experts from temporary stacks of PREFILL_GROUP experts and
+# never installs them, so a prompt does not evict the decode working set. Resident
+# experts still run from their slots. OMLX_INKLING2_PREFILL_NO_EVICT=0 restores the
+# v0.1 behaviour (install every routed expert in capacity-sized chunks).
+PREFILL_GROUP = max(1, int(os.environ.get("OMLX_INKLING2_PREFILL_GROUP", "32")))
+PREFILL_NO_EVICT = os.environ.get("OMLX_INKLING2_PREFILL_NO_EVICT", "1") != "0"
+# Current-group payload plus read-ahead; allow one whole compute group even
+# below this budget so gathering and reduction order never depend on IO sizing.
+PREFILL_IO_BYTES = int(
+    float(os.environ.get("OMLX_INKLING2_PREFILL_IO_MB", "2048")) * (1 << 20)
+)
+
+
+class _TempProj:
+    """Duck-typed :class:`ExpertProj` over a temporary ``[G, ...]`` stack.
+
+    Reuses ExpertProj's own ``__call__`` (the same ``gather_qmm``) and
+    ``post_scale``; only the stacked arrays differ.
+    """
+
+    def __init__(self, src: ExpertProj, fields: dict):
+        self.mode, self.bits, self.group_size = src.mode, src.bits, src.group_size
+        self._fields = fields
+
+    def get(self, key, default=None):
+        return self._fields.get(key, default)
+
+    def __getitem__(self, key):
+        return self._fields[key]
+
+    weight = property(lambda self: self._fields["weight"])
+    scales = property(lambda self: self._fields["scales"])
+    global_scale = property(lambda self: self._fields["global_scale"])
+    post_scale = ExpertProj.post_scale
+    __call__ = ExpertProj.__call__
+
+
+class _TempExperts:
+    """``Inkling2Experts.routes`` over two :class:`_TempProj` projections."""
+
+    def __init__(self, experts: Inkling2Experts, w13: _TempProj, w2: _TempProj):
+        self.w13, self.w2 = w13, w2
+        self._gcap, self._ucap = experts._gcap, experts._ucap
+
+    routes = Inkling2Experts.routes
 
 # MLX 0.32.4 GPU gather_qmm(..., sorted_indices=True) with M=1 switches to the
 # segmented sorted kernel iff routes >= max(16, 4 * weight.shape[0]) across
@@ -119,7 +263,11 @@ def _close_store(store: CheckpointExpertStore | None) -> int:
 
 def _drain(pending: dict) -> None:
     """Cancel or wait for pending reads so no read outlives open descriptors."""
-    futures = [f for group in pending.values() for _, _, f in group]
+    _drain_futures([f for group in pending.values() for _, _, f in group])
+
+
+def _drain_futures(futures) -> None:
+    """Drain a registry independent of groups removed during consumption."""
     for future in futures:
         future.cancel()
     if futures:
@@ -416,11 +564,15 @@ class _SlotCache:
             (write, self.view.plan(write[0], write[1], e)) for write in self._writes
         ]
 
-    def _submit(self, pool, e: int) -> list:
-        return [
-            (write, plan, pool.submit(CheckpointExpertStore.read, plan))
-            for write, plan in self._plans(e)
-        ]
+    def _submit(self, pool, e: int, reads: set) -> list:
+        group = []
+        for write, plan in self._plans(e):
+            future = pool.submit(CheckpointExpertStore.read, plan)
+            # Register each future immediately: even a later submit can fail
+            # before the caller receives this expert's group.
+            reads.add(future)
+            group.append((write, plan, future))
+        return group
 
     def read_ahead(self, ids, limit: int) -> dict:
         """Start reading up to ``limit`` non-resident experts without mutating cache."""
@@ -428,24 +580,43 @@ class _SlotCache:
         out: dict[int, list] = {}
         if pool is None or limit <= 0:
             return out
-        for e in dict.fromkeys(int(e) for e in ids):
-            if len(out) >= limit:
-                break
-            if e not in self.slot_of:
-                out[e] = self._submit(pool, e)
+        reads = set()
+        try:
+            for e in dict.fromkeys(int(e) for e in ids):
+                if len(out) >= limit:
+                    break
+                if e not in self.slot_of:
+                    out[e] = self._submit(pool, e, reads)
+        except BaseException:
+            _drain_futures(reads)
+            raise
         return out
 
     def ensure(self, idx: mx.array) -> None:
         if self.warm:
+            return
+        if TIMING:
+            t0 = time.perf_counter()
+            ids = idx.reshape(-1).tolist()  # waits for the router on the GPU
+            _tadd("dec_sync", t0)
+            t0 = time.perf_counter()
+            self.ensure_ids(ids)
+            _tadd("dec_ensure", t0)
             return
         self.ensure_ids(idx.reshape(-1).tolist())
 
     def ensure_ids(self, ids, pending: dict | None = None) -> None:
         """Load missing experts through the shared reader and protect current hits."""
         pending = dict(pending or {})
+        reads = {f for group in pending.values() for _, _, f in group}
+        try:
+            self._ensure_ids(ids, pending, reads)
+        finally:
+            _drain_futures(reads)
+
+    def _ensure_ids(self, ids, pending: dict, reads: set) -> None:
         needed = list(dict.fromkeys(int(e) for e in ids))
         if len(needed) > self.capacity:
-            _drain(pending)
             raise ValueError("Expert cache capacity is smaller than the call's routes")
         misses = []
         for e in needed:
@@ -455,7 +626,6 @@ class _SlotCache:
             else:
                 misses.append(e)
         if not misses:
-            _drain(pending)
             return
         protected = set(needed)
         pool = _io_pool()
@@ -470,49 +640,51 @@ class _SlotCache:
                 e = misses[submitted]
                 submitted += 1
                 if e not in pending:
-                    pending[e] = self._submit(pool, e)
+                    pending[e] = self._submit(pool, e, reads)
 
-        try:
-            submit(window)
-            for done, e in enumerate(misses):
-                # Refill before this expert's writes so at most ``window``
-                # experts' bytes exist at once, counting the one written here.
-                submit(done + window)
-                group = pending.pop(e, None)
-                if group is not None:
-                    raws = [(write, plan, f.result()) for write, plan, f in group]
-                else:
-                    raws = [
-                        (write, plan, CheckpointExpertStore.read(plan))
-                        for write, plan in self._plans(e)
-                    ]
-                if self.free:
-                    slot = self.free.pop()
-                else:
-                    victim = next(v for v in self.slot_of if v not in protected)
-                    slot = self.slot_of.pop(victim)
-                    self.slot_expert[slot] = -1
-                    self.map[victim] = -1
-                try:
-                    for (proj_name, field), plan, raw in raws:
-                        proj = getattr(self.experts, proj_name)
-                        proj[field][slot] = self.view.to_slot_array(field, plan, raw)
-                    for proj_name, scale in self.global_scales.items():
-                        getattr(self.experts, proj_name)["global_scale"][slot] = scale[
-                            e
-                        ]
-                except BaseException:
-                    self.free.append(slot)
-                    raise
-                self.slot_of[e] = slot
-                self.slot_expert[slot] = e
-                self.map[e] = slot
-                self.misses += 1
-                self.fetched_bytes += sum(plan.nbytes for _, plan, _ in raws)
-                del raws
-        finally:
-            _drain(pending)
+        submit(window)
+        for done, e in enumerate(misses):
+            # Refill before this expert's writes so at most ``window``
+            # experts' bytes exist at once, counting the one written here.
+            submit(done + window)
+            group = pending.pop(e, None)
+            if group is not None:
+                raws = []
+                for write, plan, future in group:
+                    raws.append((write, plan, future.result()))
+                    reads.remove(future)
+            else:
+                raws = [
+                    (write, plan, CheckpointExpertStore.read(plan))
+                    for write, plan in self._plans(e)
+                ]
+            self._install(e, raws, protected)
+            del raws
         self.warm = len(self.slot_of) == self.n_experts
+
+    def _install(self, e: int, raws: list, protected: set[int]) -> None:
+        """Install one complete expert, evicting only outside the current routes."""
+        if self.free:
+            slot = self.free.pop()
+        else:
+            victim = next(v for v in self.slot_of if v not in protected)
+            slot = self.slot_of.pop(victim)
+            self.slot_expert[slot] = -1
+            self.map[victim] = -1
+        try:
+            for (proj_name, field), plan, raw in raws:
+                proj = getattr(self.experts, proj_name)
+                proj[field][slot] = self.view.to_slot_array(field, plan, raw)
+            for proj_name, scale in self.global_scales.items():
+                getattr(self.experts, proj_name)["global_scale"][slot] = scale[e]
+        except BaseException:
+            self.free.append(slot)
+            raise
+        self.slot_of[e] = slot
+        self.slot_expert[slot] = e
+        self.map[e] = slot
+        self.misses += 1
+        self.fetched_bytes += sum(plan.nbytes for _, plan, _ in raws)
 
     def close(self) -> int:
         """Close the store's open shard descriptors (shared across wrapped layers)."""
@@ -526,7 +698,291 @@ class OffloadedInkling2Experts(nn.Module):
         super().__init__()
         self.cache = cache
 
-    def _forward_expert_major(
+    def _forward_decode_overlap(self, x, inds, weights, ids, pool):
+        """Evaluate resident routes while bounded miss reads run on the IO pool.
+
+        Completed experts run in batches without waiting for earlier slow reads.
+        Every batch is evaluated before the next slot write, releasing the lazy
+        gathers' references to the slot tensors. Only route rows are reordered;
+        the final combine sees exactly the original shape and reduction order.
+        """
+        c = self.cache
+        needed = list(dict.fromkeys(ids))
+        missing = [e for e in needed if e not in c.slot_of]
+        if not missing or len(missing) == len(needed):
+            return None  # No useful resident/read overlap: keep the single gather.
+        protected = set(needed)
+        for e in needed:
+            if e in c.slot_of:
+                c.slot_of[e] = c.slot_of.pop(e)
+                c.hits += 1
+        positions = {}
+        for p, e in enumerate(ids):
+            positions.setdefault(e, []).append(p)
+        hit_pos = [p for p, e in enumerate(ids) if e in c.slot_of]
+        flat_x = x.reshape(-1, x.shape[-1])
+        k = inds.shape[-1]
+        pending = {}
+        submitted = 0
+        window = c.io_window()
+        outs, order = [], []
+
+        def submit():
+            nonlocal submitted
+            while submitted < len(missing) and len(pending) < window:
+                e = missing[submitted]
+                # Retain each future immediately, including partial submission
+                # and the group whose result() raises, until final cleanup.
+                group = pending[e] = []
+                for write, plan in c._plans(e):
+                    group.append(
+                        (write, plan, pool.submit(CheckpointExpertStore.read, plan))
+                    )
+                submitted += 1
+
+        def compute(pos, counter, materialize=True):
+            if TIMING:
+                start = time.perf_counter()
+            rows = mx.take(flat_x, mx.array([p // k for p in pos], mx.int32), axis=0)
+            slots = mx.array([c.slot_of[ids[p]] for p in pos], dtype=inds.dtype)
+            out = c.experts.routes(rows, slots.reshape(-1, 1), sorted_hint=False)[
+                :, 0, :
+            ]
+            # Reads continue during this eval. Do not leave a lazy gather alive
+            # across a slot write: that can copy the entire resident weight slab.
+            # The last miss batch has no following write; leave it lazy so its
+            # gather and the final combine share the caller's evaluation. Timing
+            # mode evaluates it here to measure compute rather than graph build.
+            if materialize or TIMING:
+                mx.eval(out)
+            if TIMING:
+                _tadd(counter, start)
+            outs.append(out)
+            order.extend(pos)
+
+        if TIMING:
+            _tcount("dec_overlap_calls")
+        try:
+            submit()
+            compute(hit_pos, "dec_overlap_res_eval")
+            while pending:
+                if TIMING:
+                    start = time.perf_counter()
+                while True:
+                    # Surface any failed slab immediately, even when the rest of
+                    # that expert is still running; finally drains all its reads.
+                    for group in pending.values():
+                        for _, _, future in group:
+                            if future.done():
+                                future.result()
+                    ready = [
+                        e
+                        for e, group in pending.items()
+                        if all(f.done() for _, _, f in group)
+                    ]
+                    if ready:
+                        break
+                    wait(
+                        [
+                            f
+                            for group in pending.values()
+                            for _, _, f in group
+                            if not f.done()
+                        ],
+                        return_when=FIRST_COMPLETED,
+                    )
+                if TIMING:
+                    _tadd("dec_overlap_read_wait", start)
+                    start = time.perf_counter()
+                pos = []
+                for e in ready:
+                    raws = [(w, plan, f.result()) for w, plan, f in pending[e]]
+                    c._install(e, raws, protected)
+                    del raws, pending[e]
+                    pos.extend(positions[e])
+                if TIMING:
+                    _tadd("dec_overlap_install", start)
+                submit()  # The next read window overlaps this batch's compute.
+                compute(pos, "dec_overlap_miss_eval", materialize=bool(pending))
+        finally:
+            _drain(pending)
+        # Completion order must not change next token's LRU victim preference.
+        for e in missing:
+            c.slot_of[e] = c.slot_of.pop(e)
+        c.warm = len(c.slot_of) == c.n_experts
+        back = [0] * len(ids)
+        for row, p in enumerate(order):
+            back[p] = row
+        z = mx.take(mx.concatenate(outs), mx.array(back, mx.int32), axis=0)
+        z = z.reshape((*inds.shape, x.shape[-1]))
+        slots = mx.take(c.map, inds).astype(inds.dtype)
+        return c.experts.combine(z, slots, weights, x.dtype)
+
+    def _forward_expert_major(self, flat_x, inds, weights, ids, k, out_dtype):
+        if TIMING:
+            t0 = time.perf_counter()
+            try:
+                return self._forward_expert_major_scoped(
+                    flat_x, inds, weights, ids, k, out_dtype
+                )
+            finally:
+                _tadd("em_wall", t0)
+                _tcount("em_calls")
+                _tflush()
+        return self._forward_expert_major_scoped(
+            flat_x, inds, weights, ids, k, out_dtype
+        )
+
+    def _forward_expert_major_scoped(self, flat_x, inds, weights, ids, k, out_dtype):
+        with _prefill_cache_scope():
+            if not PREFILL_NO_EVICT:
+                return self._forward_expert_major_install(
+                    flat_x, inds, weights, ids, k, out_dtype
+                )
+            return self._forward_expert_major_no_evict(
+                flat_x, inds, weights, ids, k, out_dtype
+            )
+
+    def _forward_expert_major_no_evict(
+        self,
+        flat_x: mx.array,
+        inds: mx.array,
+        weights: mx.array,
+        ids: list[int],
+        k: int,
+        out_dtype,
+    ) -> mx.array:
+        """Resident experts from slots; the rest from temporary stacks, never installed."""
+        c = self.cache
+        d_model = flat_x.shape[-1]
+        if TIMING:
+            tp = time.perf_counter()
+        ids_np = np.asarray(ids, dtype=np.int64)
+        resident = np.zeros(c.n_experts, dtype=np.bool_)
+        resident[c.slot_expert[c.slot_expert >= 0]] = True
+        # Resident routes first, then non-resident routes in ascending expert id.
+        rank = ids_np + (~resident[ids_np]) * c.n_experts
+        order = np.argsort(rank, kind="stable")
+        sorted_ids = ids_np[order]
+        n_res = int(resident[ids_np].sum())
+        res_unique = np.unique(sorted_ids[:n_res]).tolist()
+        miss_unique = np.unique(sorted_ids[n_res:]).tolist()
+        for e in res_unique:
+            c.slot_of[e] = c.slot_of.pop(e)  # keep LRU order as the install path does
+        c.hits += len(res_unique)
+        outs = []
+        if TIMING:
+            _tadd("em_plan", tp)
+        if n_res:
+            slots = mx.take(c.map, mx.array(sorted_ids[:n_res], dtype=mx.int32))
+            t_idx = mx.array(order[:n_res] // k, dtype=mx.int32)
+            xe = mx.take(flat_x, t_idx, axis=0)
+            o = c.experts.routes(xe, slots.astype(inds.dtype).reshape(-1, 1))[:, 0, :]
+            if TIMING:
+                te = time.perf_counter()
+            mx.eval(o)
+            if TIMING:
+                _tadd("em_res_eval", te)
+            outs.append(o)
+        groups = [
+            miss_unique[i : i + PREFILL_GROUP]
+            for i in range(0, len(miss_unique), PREFILL_GROUP)
+        ]
+        tail = sorted_ids[n_res:]
+        bounds = [n_res + int(np.searchsorted(tail, g[0])) for g in groups]
+        bounds.append(len(ids))
+        pool = _io_pool()
+        window = max(PREFILL_GROUP, PREFILL_IO_BYTES // max(1, c.expert_bytes))
+        reads = set()
+
+        def submit(group, into):
+            if pool is not None:
+                for e in group:
+                    if e not in into:
+                        into[e] = c._submit(pool, e, reads)
+
+        pending = {}
+        try:
+            if groups:
+                submit(groups[0], pending)
+            for gi, group in enumerate(groups):
+                current = pending
+                # Complete a partially prefetched group without changing its
+                # compute shape, then spend the remaining bytes on read-ahead.
+                submit(group, current)
+                pending = {}
+                if gi + 1 < len(groups):
+                    submit(groups[gi + 1][: window - len(group)], pending)
+                stacks: dict = {}
+                for e in group:
+                    parts = current.pop(e, None)
+                    if parts is None:
+                        parts = [(w, plan, None) for w, plan in c._plans(e)]
+                    for (proj_name, field), plan, fut in parts:
+                        if TIMING:
+                            tr = time.perf_counter()
+                        raw = (
+                            fut.result()
+                            if fut is not None
+                            else CheckpointExpertStore.read(plan)
+                        )
+                        if fut is not None:
+                            # Release consumed futures so the registry does not
+                            # retain every expert's raw payload until call exit.
+                            reads.remove(fut)
+                        if TIMING:
+                            _tadd("em_read_wait", tr)
+                            tr = time.perf_counter()
+                        stacks.setdefault((proj_name, field), []).append(
+                            c.view.to_slot_array(field, plan, raw)
+                        )
+                        if TIMING:
+                            _tadd("em_convert", tr)
+                            _tcount("em_bytes", plan.nbytes)
+                        c.fetched_bytes += plan.nbytes
+                    c.misses += 1
+                    # Do not carry the last consumed expert's bytes into the
+                    # next group's submission window through these locals.
+                    del parts, raw, fut
+                gidx = mx.array(group, dtype=mx.int32)
+                projs = {}
+                for proj_name in _PROJS:
+                    src = getattr(c.experts, proj_name)
+                    fields = {
+                        f: mx.stack(stacks[(proj_name, f)]) for f in _fields(src)
+                    }
+                    if proj_name in c.global_scales:
+                        fields["global_scale"] = c.global_scales[proj_name][gidx]
+                    projs[proj_name] = _TempProj(src, fields)
+                temp = _TempExperts(c.experts, projs["w13"], projs["w2"])
+                start, end = bounds[gi], bounds[gi + 1]
+                local = np.searchsorted(np.asarray(group), sorted_ids[start:end])
+                t_idx = mx.array(order[start:end] // k, dtype=mx.int32)
+                xe = mx.take(flat_x, t_idx, axis=0)
+                o = temp.routes(xe, mx.array(local, dtype=inds.dtype).reshape(-1, 1))
+                o = o[:, 0, :]
+                if TIMING:
+                    te = time.perf_counter()
+                mx.eval(o)
+                if TIMING:
+                    _tadd("em_grp_eval", te)
+                    _tcount("em_groups")
+                outs.append(o)
+                del stacks, projs, temp
+        finally:
+            _drain_futures(reads)
+        out = mx.concatenate(outs, axis=0)
+        inverse = mx.array(np.argsort(order, kind="stable"), dtype=mx.int32)
+        z = mx.take(out, inverse, axis=0).reshape((*inds.shape, d_model))
+        s2_table = c.global_scales.get("w2")
+        if s2_table is None:
+            return c.experts.combine(z, inds, weights, out_dtype)
+        s2 = s2_table[inds] * (1.0 / _NVFP4_DENOMINATOR)
+        return mx.sum(z.astype(mx.float32) * (weights * s2)[..., None], axis=-2).astype(
+            out_dtype
+        )
+
+    def _forward_expert_major_install(
         self,
         flat_x: mx.array,
         inds: mx.array,
@@ -583,6 +1039,21 @@ class OffloadedInkling2Experts(nn.Module):
         )
 
     def __call__(self, x: mx.array, inds: mx.array, weights: mx.array) -> mx.array:
+        if not TIMING:
+            return self._call(x, inds, weights)
+        t0 = time.perf_counter()
+        m0 = self.cache.misses
+        expert_major = _T.get("em_calls", 0)
+        try:
+            return self._call(x, inds, weights)
+        finally:
+            if _T.get("em_calls", 0) == expert_major:
+                _tadd("dec_wall", t0)
+                _tcount("dec_calls")
+                _tcount("dec_misses", self.cache.misses - m0)
+                _tflush()
+
+    def _call(self, x: mx.array, inds: mx.array, weights: mx.array) -> mx.array:
         c = self.cache
         flat_i = inds.reshape(-1, inds.shape[-1])
         n_tok, k = flat_i.shape
@@ -594,11 +1065,27 @@ class OffloadedInkling2Experts(nn.Module):
             ids = flat_i.reshape(-1).tolist()
             fits = len(set(ids)) <= c.capacity
         if fits:
+            if DECODE_OVERLAP and not c.warm and inds.size < _DECODE_OVERLAP_MAX_ROUTES:
+                pool = _io_pool()
+                if pool is not None:
+                    if ids is None:
+                        if TIMING:
+                            start = time.perf_counter()
+                        ids = flat_i.reshape(-1).tolist()
+                        if TIMING:
+                            _tadd("dec_sync", start)
+                    out = self._forward_decode_overlap(x, inds, weights, ids, pool)
+                    if out is not None:
+                        return out
             if not c.warm:
                 if ids is None:
                     c.ensure(inds)
                 else:
+                    if TIMING and DECODE_OVERLAP:
+                        start = time.perf_counter()
                     c.ensure_ids(ids)
+                    if TIMING and DECODE_OVERLAP:
+                        _tadd("dec_ensure", start)
             slots = mx.take(c.map, inds).astype(inds.dtype)
             # Match stock's effective gather_qmm kernel choice from n_experts rather
             # than capacity: when capacity < n_experts and B < 4 * n_experts, passing

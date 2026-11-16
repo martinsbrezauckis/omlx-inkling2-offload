@@ -1,43 +1,48 @@
-omlx-inkling2-offload
+omlx-inkling2-offload 0.2.0
 Copyright (c) 2026 Martins Brezauckis
 
-This package contains two licensing components:
+MIT License (see LICENSE):
+  - module/omlx/patches/inkling2/moe_offload.py
+  - tests/test_inkling2_decode_overlap.py
+  - tests/test_inkling2_helper_cache.py
+  - tests/test_inkling2_moe_offload.py
+  - tests/test_inkling2_offload_io.py
+  - tests/test_inkling2_offload_timing.py
+  - tests/test_inkling2_offload_wiring.py
+  - tests/test_inkling2_prefill_cache_scope.py
+  - tests/test_inkling2_prefill_no_evict.py
+  - tests/test_inkling2_split_experts.py
+  - tests/test_inkling2_window_cache.py
+  - tests/test_moe_io_workers_env.py
+  - tests/test_scheduler_rotating_arrays_block.py
+  - install.py
+  - README.md
+  - CHANGELOG.md
 
-1. New code, tests, installer, and documentation (MIT License — see LICENSE):
-   - module/omlx/patches/inkling2/moe_offload.py
-   - tests/test_inkling2_split_experts.py
-   - tests/test_inkling2_moe_offload.py
-   - tests/test_inkling2_offload_wiring.py
-   - install.py
-   - README.md
-   - CHANGELOG.md
+The offload module imports oMLX's existing CheckpointExpertStore, I/O pool,
+cache-clearing, and dtype helpers rather than copying those implementations.
 
-   The offload module imports oMLX's existing CheckpointExpertStore, I/O pool,
-   cache-clearing, and dtype helpers from oMLX rather than copying upstream code.
+Apache License, Version 2.0 (see LICENSES/Apache-2.0.txt):
+  - patches/omlx-624cff0e.patch
+  - tests/fixtures/prefill_contract/inkling2/case.npz
+  - tests/fixtures/prefill_contract/inkling2/meta.json
+  - tests/test_scheduler_prefill_step_size.py
 
-2. Upstream hook patch (Apache License, Version 2.0 — see LICENSES/Apache-2.0.txt):
-   - patches/omlx-624cff0e.patch
+The patch hunks and replacement fixtures modify oMLX (jundot/omlx) commit
+624cff0e23519ba46a4d5ed2802c2c236ad1a9ac, licensed under Apache-2.0.
+Copyright 2025 oMLX contributors. The upstream license is reproduced in
+LICENSES/Apache-2.0.txt. The copied scheduler prefill-step test retains its
+Apache-2.0 source header.
 
-   patches/omlx-624cff0e.patch modifies files from oMLX (jundot/omlx, commit
-   624cff0e23519ba46a4d5ed2802c2c236ad1a9ac), which is licensed under the Apache
-   License, Version 2.0 ("Copyright 2025 oMLX contributors", see the upstream
-   LICENSE file, copied verbatim in LICENSES/Apache-2.0.txt). The patch itself
-   is provided under the Apache License, Version 2.0.
+Modified upstream files in patches/omlx-624cff0e.patch:
+  - omlx/engine/vlm.py
+  - omlx/model_settings.py
+  - omlx/patches/inkling2/model.py
+  - omlx/patches/moe_expert_offload.py
+  - omlx/patches/moe_offload_compat.py
+  - omlx/prefill_helper/adapters/inkling2.py
+  - omlx/scheduler.py
+  - omlx/utils/model_loading.py
 
-   Modified upstream files in patches/omlx-624cff0e.patch:
-   - omlx/engine/vlm.py
-   - omlx/model_settings.py
-   - omlx/patches/inkling2/model.py
-   - omlx/patches/moe_expert_offload.py
-   - omlx/patches/moe_offload_compat.py
-   - omlx/utils/model_loading.py
-
-   The patch was exported directly from the diff against upstream commit
-   624cff0e23519ba46a4d5ed2802c2c236ad1a9ac using:
-     git diff c17ea95..HEAD -- \
-       omlx/engine/vlm.py \
-       omlx/model_settings.py \
-       omlx/patches/inkling2/model.py \
-       omlx/patches/moe_expert_offload.py \
-       omlx/patches/moe_offload_compat.py \
-       omlx/utils/model_loading.py
+Upstream base:
+  jundot/omlx main 624cff0e23519ba46a4d5ed2802c2c236ad1a9ac.
