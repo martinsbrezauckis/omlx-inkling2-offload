@@ -9,6 +9,7 @@ Routed-expert SSD offload for Inkling 2 Small in oMLX 0.8.0rc1 (main 624cff0e).
 - Installer: Python >= 3.10; standard library only.
 - oMLX runtime: Python >= 3.11, < 3.14; installed oMLX dependencies and native kernels.
 - RAM: tested on 256 GB.
+- Model: [mlx-community/Inkling-2-Small-oQ4e](https://huggingface.co/mlx-community/Inkling-2-Small-oQ4e) (318 GB).
 - Package version: `0.2.0`.
 
 ## Install / check / uninstall
@@ -71,10 +72,16 @@ PYTHONPATH="$PWD" /path/to/venv/bin/python -m pytest -q -p no:cacheprovider \
 
 ## Results
 
-| Config | Prompt tok/s | Generation tok/s |
-| --- | --- | --- |
-| Replay 27 requests | — | — |
-| Sustained agentic coding run | — | — |
+- Hardware: Mac Studio M5 Ultra, 256 GB unified memory.
+- Model: Inkling-2-Small oQ4e, 318 GB; 55 % of routed experts resident.
+- Generation tok/s = completion tokens / generation time; prompt tok/s = uncached prompt tokens / prompt time.
+
+| Workload | Version | Prompt tok/s | Generation tok/s |
+| --- | --- | --- | --- |
+| Replay, 27 recorded agentic requests | 0.1.0 (50 % resident) | 97.2 | 10.51 |
+| Replay, 27 recorded agentic requests | 0.2.0 | 229.6 | 12.49 |
+| Agentic coding run, first 123 requests | 0.1.0 (50 % resident) | 71.9 | 10.99 |
+| Agentic coding run, first 123 requests | 0.2.0 | 130.7 | 11.90 |
 
 ## Limits
 
@@ -82,6 +89,7 @@ PYTHONPATH="$PWD" /path/to/venv/bin/python -m pytest -q -p no:cacheprovider \
 - Prefill helper rejected with offload.
 - Outputs not bit-identical across chunk sizes.
 - Tested model: Inkling-2-Small oQ4e only.
+- Memory guard: other apps lower oMLX's limit; prefill then slows or a too-large prompt is refused.
 
 ## Files
 

@@ -1,0 +1,57 @@
+# Installer check against the supported upstream oMLX source.
+#
+# Downloads jundot/omlx at the supported commit, then runs install.py --check, install, --check, uninstall and
+# compares every file with the pristine tree. It also compiles every Python file in the package. The offload tests
+# themselves need Apple Silicon (Metal) and an oMLX environment and are run on maintainer machines.
+#
+# Needs no secrets, holds read-only repository permission and publishes nothing. Third-party actions are pinned to
+# full commit SHAs (the tag is in the comment).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  installer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      OMLX_COMMIT: 624cff0e23519ba46a4d5ed2802c2c236ad1a9ac
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Compile package sources
+        run: python -m compileall -q install.py module tests
+      - name: Fetch upstream oMLX
+        run: |
+          mkdir -p "$RUNNER_TEMP/omlx" "$RUNNER_TEMP/pristine"
+          curl -fsSL "https://codeload.github.com/jundot/omlx/tar.gz/$OMLX_COMMIT" \
+            | tar -xz -C "$RUNNER_TEMP/omlx" --strip-components=1
+          cp -a "$RUNNER_TEMP/omlx/." "$RUNNER_TEMP/pristine/"
+      - name: Check, install, check, uninstall
+        run: |
+          T="$RUNNER_TEMP/omlx"
+          python install.py --omlx "$T" --check || test $? -eq 1
+          python install.py --omlx "$T"
+          python install.py --omlx "$T" --check
+          if python install.py --omlx "$T"; then echo "double install was not refused"; exit 1; fi
+          python install.py --omlx "$T" --uninstall
+      - name: Tree is pristine after uninstall
+        run: diff -r "$RUNNER_TEMP/pristine" "$RUNNER_TEMP/omlx"
